@@ -386,6 +386,7 @@ textarea.mono{font-family:var(--font-mono);font-size:12px;}
 <div id="app"><div class="loading-screen">Loading the ledger…</div></div>
 <div id="toast-wrap"></div>
 <script>
+
 /* ===================================================================
    WARDEN — D&D Creature & Combat Manager
    Single-file vanilla JS app. Fully offline: persists to this
@@ -617,7 +618,7 @@ function blankGenericCombatant(name){
    the app is fully functional with it disconnected forever.
 --------------------------------------------------------------- */
 function defaultDB(){
-  return { templates:[], campaigns:[], maps:[], playerCharacters:[], recentGlobal:[], recentGlobalPc:[], settings:{ darkMode:true }, version:1 };
+  return { templates:[], campaigns:[], maps:[], playerCharacters:[], modifiers:[], recentGlobal:[], recentGlobalPc:[], settings:{ darkMode:true }, version:1 };
 }
 
 const IDB_NAME = 'warden-db';
@@ -745,6 +746,7 @@ async function loadDB(){
       if(!DB.recentGlobal) DB.recentGlobal=[];
       if(!DB.maps) DB.maps=[];
       if(!DB.playerCharacters) DB.playerCharacters=[];
+      if(!DB.modifiers) DB.modifiers=[];
       if(!DB.recentGlobalPc) DB.recentGlobalPc=[];
       DB.campaigns.forEach(c=>{ if(!c.playerCharacterRefs) c.playerCharacterRefs=[]; });
       if(!DB.settings) DB.settings={darkMode:true};
@@ -1358,6 +1360,7 @@ const NAV_ITEMS = [
   {id:'dashboard', icon:'&#9670;', label:'Dashboard'},
   {id:'campaigns', icon:'&#128220;', label:'Campaigns'},
   {id:'library', icon:'&#128218;', label:'Creature Library'},
+  {id:'modifiers', icon:'&#9889;', label:'Modifiers'},
   {id:'dice', icon:'&#127922;', label:'Dice Roller'},
   {id:'importexport', icon:'&#8646;', label:'Import / Export'},
   {id:'settings', icon:'&#9881;', label:'Settings'},
@@ -1366,7 +1369,7 @@ const MOBILE_NAV = [
   {id:'dashboard', icon:'&#9670;', label:'Home'},
   {id:'campaigns', icon:'&#128220;', label:'Camps'},
   {id:'library', icon:'&#128218;', label:'Library'},
-  {id:'dice', icon:'&#127922;', label:'Dice'},
+  {id:'modifiers', icon:'&#9889;', label:'Mods'},
   {id:'settings', icon:'&#9881;', label:'More'},
 ];
 
@@ -1429,6 +1432,7 @@ function render(){
     switch(VIEW.name){
       case 'dashboard': root.innerHTML = viewDashboard(); break;
       case 'library': root.innerHTML = viewLibrary(); break;
+      case 'modifiers': root.innerHTML = viewModifiers(); break;
       case 'campaigns': root.innerHTML = viewCampaignsList(); break;
       case 'campaignDetail': root.innerHTML = viewCampaignDetail(VIEW.params.id); break;
       case 'combat': root.innerHTML = viewCombat(VIEW.params.campId, VIEW.params.encId); break;
@@ -1702,7 +1706,10 @@ function libraryCardHTML(t){
         </div>
         ${t.tags&&t.tags.length?`<div class="tag-list">${t.tags.slice(0,4).map(tg=>`<span class="pill">${esc(tg)}</span>`).join('')}</div>`:''}
       </div>
+      ${t.isVariant?`<div class="small faint" style="margin-top:2px;">&#9889; Variant${t.baseTemplateId&&getTemplateAny(t.baseTemplateId)?(' of '+esc(getTemplateAny(t.baseTemplateId).name)):''}</div>`:''}
       <div class="btn-row" style="margin-top:2px;">
+        <button class="btn btn-xs btn-gold" onclick="event.stopPropagation();openApplyModifiersModal('${t.id}')">&#9889; Modifiers</button>
+        ${t.isVariant?`<button class="btn btn-xs" onclick="event.stopPropagation();confirmRecomputeVariant('${t.id}')">Recompute</button>`:''}
         <button class="btn btn-xs" onclick="event.stopPropagation();quickDuplicate('${t.id}')">Duplicate</button>
         <button class="btn btn-xs" onclick="event.stopPropagation();exportSingle('template','${t.id}')">Export</button>
         <button class="btn btn-xs btn-danger" onclick="event.stopPropagation();confirmDeleteTemplate('${t.id}')">Delete</button>
@@ -2925,6 +2932,7 @@ function rollPcDamage(pcId, actionIdx){
   const a = pc.actions[actionIdx];
   const res = rollExpression(a.damageDice);
   if(!res){ toast('Could not parse damage dice: '+a.damageDice, true); return; }
+  applyDamageMultiplier(res, a);
   showRollResultModal(`${a.name} — Damage${a.damageType?' ('+a.damageType+')':''}`, res.total, res.breakdown);
 }
 window.rollPcDamage = rollPcDamage;
@@ -3490,6 +3498,7 @@ function addCombatantsCreaturesTab(camp, campId, encId){
           <div><b>${esc(t.name)}</b> <span class="faint small">${[t.size,t.type].filter(Boolean).join(' ')}${t.maxHP?' · '+t.maxHP+' HP':''}</span></div>
           <div class="flex gap6">
             <input type="number" min="1" value="1" style="width:64px;" id="qty-${t.id}">
+            <button class="btn btn-sm" title="Apply modifiers before adding" onclick="openApplyModifiersModal('${t.id}',{campId:'${campId}',encId:'${encId}'})">&#9889;</button>
             <button class="btn btn-sm btn-gold" onclick="addTemplateToEncounter('${campId}','${encId}','${t.id}')">Add</button>
           </div>
         </div>`).join('') || '<p class="faint small">No creatures available. Create one first.</p>'}
@@ -3787,6 +3796,8 @@ function participantCardHTML(camp, enc, p, sortedIdx){
 
     ${cols.notes?`<textarea class="mt6" placeholder="Combat notes…" oninput="setInstanceNotes('${camp.id}','${enc.id}','${p.id}', this.value)">${esc(p.instanceNotes||'')}</textarea>`:''}
 
+    ${p.sourceModifiers && p.sourceModifiers.modifierIds && p.sourceModifiers.modifierIds.length ? participantModifiersHTML(camp, enc, p) : ''}
+
     <div class="btn-row mt6">
       <button class="btn btn-xs" onclick="openInstanceDetailModal('${camp.id}','${enc.id}','${p.id}')">Full Sheet</button>
     </div>
@@ -3957,9 +3968,22 @@ function rollDamage(campId, encId, partId, actionId){
   const a = (p.actions||[]).find(x=>x.id===actionId);
   const res = rollExpression(a.damageDice);
   if(!res){ toast('Could not parse damage dice: '+a.damageDice, true); return; }
+  applyDamageMultiplier(res, a);
   showRollResultModal(`${a.name} — Damage${a.damageType?' ('+a.damageType+')':''}`, res.total, res.breakdown);
 }
 window.rollDamage = rollDamage;
+/* Applies a modifier's "multiply the ROLLED total" damage effect (see the
+   Creature Modifier System, section 27) after the dice have already been
+   rolled — this is the one damage-change mode that genuinely can't be
+   pre-baked into the displayed damage formula, since it multiplies the
+   actual result, not the dice themselves. Mutates res in place. */
+function applyDamageMultiplier(res, action){
+  if(!action || !action._dmgMultiplier || action._dmgMultiplier===1) return res;
+  const before = res.total;
+  res.total = Math.round(res.total * action._dmgMultiplier);
+  res.breakdown = `${res.breakdown}  →  ${before} × ${action._dmgMultiplier} (modifier) = ${res.total}`;
+  return res;
+}
 function showRollResultModal(title, total, breakdown){
   pushModal({
     key:'roll-result',
@@ -4131,6 +4155,10 @@ function exportSingle(type, a, b){
     const camp = getCampaign(a); const enc = camp.encounters.find(e=>e.id===b);
     downloadJSON(`warden-encounter-${slug(enc.name)}.json`, {wardenExport:'encounter', version:1, data:enc});
     toast('Exported "'+enc.name+'"');
+  } else if(type==='modifier'){
+    const m = getModifier(a);
+    downloadJSON(`warden-modifier-${slug(m.name)}.json`, {wardenExport:'modifier', version:1, data:m});
+    toast('Exported "'+m.name+'"');
   }
 }
 window.exportSingle = exportSingle;
@@ -4227,11 +4255,16 @@ function handleParsedImport(parsed){
         e.campaignId = target.id;
         target.encounters.push(e); saveCampaign(target); toast('Imported into "'+target.name+'"'); render();
       }});
+  } else if(kind==='modifier'){
+    const m = deepClone(parsed.data);
+    m.id = uid('mod'); m.createdAt=nowISO(); m.updatedAt=nowISO();
+    openConfirmModal({ title:'Import Modifier', body:`Import "${esc(m.name)}" as a new, independent modifier template in your library?`, confirmLabel:'Import',
+      onConfirm:()=>{ DB.modifiers.push(m); scheduleSave(); toast('Imported "'+m.name+'"'); render(); } });
   } else if(kind==='full-backup'){
     openConfirmModal({ title:'Import Full Backup?', danger:true,
-      body:`This will REPLACE all current data (${activeTemplates().length} creatures, ${activePlayerCharacters().length} player characters, ${activeCampaigns().length} campaigns) with the contents of this backup. Consider exporting your current data first. This cannot be undone.`,
+      body:`This will REPLACE all current data (${activeTemplates().length} creatures, ${activePlayerCharacters().length} player characters, ${activeCampaigns().length} campaigns, ${activeModifiers().length} modifiers) with the contents of this backup. Consider exporting your current data first. This cannot be undone.`,
       confirmLabel:'Replace All Data',
-      onConfirm:()=>{ DB = parsed.data; UI.darkMode = DB.settings ? DB.settings.darkMode!==false : true; applyTheme(); scheduleSave(); toast('Backup restored'); render(); } });
+      onConfirm:()=>{ DB = parsed.data; if(!DB.modifiers) DB.modifiers=[]; if(!DB.maps) DB.maps=[]; UI.darkMode = DB.settings ? DB.settings.darkMode!==false : true; applyTheme(); scheduleSave(); toast('Backup restored'); render(); } });
   } else {
     importStatusMsg(`<p class="small" style="color:var(--blood-bright)">Unrecognized export type.</p>`);
   }
@@ -4257,7 +4290,7 @@ function viewSettings(){
     </div>
     <div class="card mt14">
       <div class="section-title">Data</div>
-      <p class="small muted mb10">${activeTemplates().length} creature templates · ${activePlayerCharacters().length} player characters · ${activeCampaigns().length} campaigns · ${activeCampaigns().reduce((n,c)=>n+activeEncounters(c).length,0)} encounters · storage: ${UI.storageBackend}</p>
+      <p class="small muted mb10">${activeTemplates().length} creature templates · ${activePlayerCharacters().length} player characters · ${activeModifiers().length} modifiers · ${activeCampaigns().length} campaigns · ${activeCampaigns().reduce((n,c)=>n+activeEncounters(c).length,0)} encounters · storage: ${UI.storageBackend}</p>
       <div class="btn-row">
         <button class="btn" onclick="go('importexport')">Go to Import / Export</button>
         <button class="btn btn-danger" onclick="confirmClearAllData()">Clear All Data</button>
@@ -4404,6 +4437,12 @@ window.__debug = {
   getPlayerCharacter, getPlayerCharacterAny, activePlayerCharacters, savePlayerCharacter,
   deletePlayerCharacter, duplicatePlayerCharacter, instanceFromPlayerCharacter, blankGenericCombatant,
   mergePlayerCharacters, mergePlayerCharacter,
+  blankModifier, blankEffect, getModifier, getModifierAny, activeModifiers, saveModifier, deleteModifier, duplicateModifier,
+  parseDiceFormula, formatDiceFormula, evalScaling, safeEvalFormula, computeModifiedCreature,
+  instanceFromTemplateWithModifiers, saveCreatureVariant, recomputeVariant, mergeModifiers, mergeModifier,
+  applyEffectToWorking:(w,e,ctx)=>{ const warnings=[]; const breakdown={}; applyEffectToWorking(w,e,ctx,breakdown,warnings); return {working:w,breakdown,warnings}; },
+  getApplyMod:()=>APPLYMOD, setApplyMod:(v)=>{APPLYMOD=v;}, getModEdit:()=>MODEDIT,
+  recomputeParticipantModifiers,
 };
 
 /* ===================================================================
@@ -4595,15 +4634,28 @@ function mergePlayerCharacters(localArr, remoteArr, baselineArr){
   return mergeById(localArr, remoteArr, baselineArr, mergePlayerCharacter);
 }
 
+/* ---- Modifier merge (same field-diff engine as templates) ---- */
+function mergeModifier(local, remote, baseline){
+  return mergeObjectFields(local, remote, baseline, { arrayUnionKeys:['tags'] });
+}
+function mergeModifiers(localArr, remoteArr, baselineArr){
+  return mergeById(localArr, remoteArr, baselineArr, mergeModifier);
+}
+
 /* ---- Top-level DB merge ---- */
 function mergeDatabases(localDB, remoteDB, baselineDB){
   const tplResult = mergeTemplates(localDB.templates, remoteDB.templates, baselineDB?baselineDB.templates:null);
   const campResult = mergeCampaigns(localDB.campaigns, remoteDB.campaigns, baselineDB?baselineDB.campaigns:null);
   const pcResult = mergePlayerCharacters(localDB.playerCharacters||[], remoteDB.playerCharacters||[], baselineDB?(baselineDB.playerCharacters||[]):null);
+  const modResult = mergeModifiers(localDB.modifiers||[], remoteDB.modifiers||[], baselineDB?(baselineDB.modifiers||[]):null);
   const mergedDB = {
     templates: tplResult.result,
     campaigns: campResult.result,
     playerCharacters: pcResult.result,
+    modifiers: modResult.result,
+    // Battle maps are a same-computer-only feature (see section 22) and were never part of the
+    // sync design — carry the local copy through unchanged so a sync never silently empties it.
+    maps: localDB.maps||[],
     recentGlobal: mergeRecent(localDB.recentGlobal, remoteDB.recentGlobal),
     recentGlobalPc: mergeRecent((localDB.recentGlobalPc||[]).map(r=>({templateId:r.pcId,ts:r.ts})), (remoteDB.recentGlobalPc||[]).map(r=>({templateId:r.pcId,ts:r.ts})))
       .map(r=>({pcId:r.templateId, ts:r.ts})),
@@ -4614,6 +4666,7 @@ function mergeDatabases(localDB, remoteDB, baselineDB){
     ...tplResult.conflicts.map(c=>({type:'template', id:c.id, name:(c.local&&c.local.name)||(c.remote&&c.remote.name)||'Unnamed creature', local:c.local, remote:c.remote, fields:c.fields})),
     ...campResult.conflicts.map(c=>({type:'campaign', id:c.id, name:(c.local&&c.local.name)||(c.remote&&c.remote.name)||'Unnamed campaign', local:c.local, remote:c.remote, fields:c.fields})),
     ...pcResult.conflicts.map(c=>({type:'playercharacter', id:c.id, name:(c.local&&c.local.name)||(c.remote&&c.remote.name)||'Unnamed character', local:c.local, remote:c.remote, fields:c.fields})),
+    ...modResult.conflicts.map(c=>({type:'modifier', id:c.id, name:(c.local&&c.local.name)||(c.remote&&c.remote.name)||'Unnamed modifier', local:c.local, remote:c.remote, fields:c.fields})),
   ];
   return {
     mergedDB, conflicts,
@@ -4621,6 +4674,7 @@ function mergeDatabases(localDB, remoteDB, baselineDB){
       templatesFromRemote: tplResult.stats.newFromRemote, templatesFromLocal: tplResult.stats.newFromLocal, templatesMerged: tplResult.stats.merged,
       campaignsFromRemote: campResult.stats.newFromRemote, campaignsFromLocal: campResult.stats.newFromLocal, campaignsMerged: campResult.stats.merged,
       pcsFromRemote: pcResult.stats.newFromRemote, pcsFromLocal: pcResult.stats.newFromLocal, pcsMerged: pcResult.stats.merged,
+      modifiersFromRemote: modResult.stats.newFromRemote, modifiersFromLocal: modResult.stats.newFromLocal, modifiersMerged: modResult.stats.merged,
     }
   };
 }
@@ -4755,6 +4809,7 @@ function buildManifest(db){
   db.templates.forEach(t=> objects[t.id] = {type:'template', path:`${SYNC_REPO_PATH}/templates/${t.id}.json`, updatedAt:t.updatedAt, version:t.version, deviceId:t.deviceId, deletedAt:t.deletedAt||null});
   db.campaigns.forEach(c=> objects[c.id] = {type:'campaign', path:`${SYNC_REPO_PATH}/campaigns/${c.id}.json`, updatedAt:c.updatedAt, version:c.version, deviceId:c.deviceId, deletedAt:c.deletedAt||null});
   (db.playerCharacters||[]).forEach(p=> objects[p.id] = {type:'playercharacter', path:`${SYNC_REPO_PATH}/players/${p.id}.json`, updatedAt:p.updatedAt, version:p.version, deviceId:p.deviceId, deletedAt:p.deletedAt||null});
+  (db.modifiers||[]).forEach(m=> objects[m.id] = {type:'modifier', path:`${SYNC_REPO_PATH}/modifiers/${m.id}.json`, updatedAt:m.updatedAt, version:m.version, deviceId:m.deviceId, deletedAt:m.deletedAt||null});
   return { version:1, updatedAt: nowISO(), deviceId:getDeviceId(), objects };
 }
 
@@ -4763,7 +4818,7 @@ async function ghReadManifest(repo, token){
   return f ? JSON.parse(f.content) : null;
 }
 async function ghReadFullDB(repo, token, manifest){
-  const templates = [], campaigns = [], playerCharacters = [];
+  const templates = [], campaigns = [], playerCharacters = [], modifiers = [];
   const entries = Object.entries(manifest.objects||{});
   for(const [id, meta] of entries){
     const f = await ghGetFile(repo, meta.path, token);
@@ -4772,8 +4827,9 @@ async function ghReadFullDB(repo, token, manifest){
     if(meta.type==='template') templates.push(obj);
     else if(meta.type==='campaign') campaigns.push(obj);
     else if(meta.type==='playercharacter') playerCharacters.push(obj);
+    else if(meta.type==='modifier') modifiers.push(obj);
   }
-  return { templates, campaigns, playerCharacters, recentGlobal:[], recentGlobalPc:[], settings:{darkMode:true}, version:1 };
+  return { templates, campaigns, playerCharacters, modifiers, maps:[], recentGlobal:[], recentGlobalPc:[], settings:{darkMode:true}, version:1 };
 }
 /* Only write files whose content actually changed vs. what's already on GitHub (per old manifest), per spec section 9. */
 async function ghWriteDB(repo, token, db, oldManifest){
@@ -4794,6 +4850,11 @@ async function ghWriteDB(repo, token, db, oldManifest){
     const path = newManifest.objects[p.id].path;
     const old = oldObjects[p.id];
     if(!old || old.version!==p.version || old.updatedAt!==p.updatedAt) writes.push({path, content:JSON.stringify(p,null,2)});
+  });
+  (db.modifiers||[]).forEach(m=>{
+    const path = newManifest.objects[m.id].path;
+    const old = oldObjects[m.id];
+    if(!old || old.version!==m.version || old.updatedAt!==m.updatedAt) writes.push({path, content:JSON.stringify(m,null,2)});
   });
   for(const w of writes){
     const existing = await ghGetFile(repo, w.path, token);
@@ -4878,7 +4939,7 @@ async function runFirstTimeSyncWizard(repo, token){
   try{ manifest = await ghReadManifest(repo, token); }
   catch(e){ toast('Could not read repository contents: '+e.message, true); return; }
 
-  const localHasData = DB.templates.length>0 || DB.campaigns.length>0 || DB.playerCharacters.length>0;
+  const localHasData = DB.templates.length>0 || DB.campaigns.length>0 || DB.playerCharacters.length>0 || (DB.modifiers||[]).length>0;
 
   if(!manifest){
     // Situation A — empty repository
@@ -4908,7 +4969,7 @@ async function runFirstTimeSyncWizard(repo, token){
       confirmLabel:'Download and Sync',
       onConfirm: async ()=>{
         await takeSafetySnapshot('Before downloading GitHub data');
-        DB.templates = remoteDB.templates; DB.campaigns = remoteDB.campaigns; DB.playerCharacters = remoteDB.playerCharacters||[];
+        DB.templates = remoteDB.templates; DB.campaigns = remoteDB.campaigns; DB.playerCharacters = remoteDB.playerCharacters||[]; DB.modifiers = remoteDB.modifiers||[];
         await saveKV(SYNC_BASELINE_KEY, deepClone(DB));
         await saveSyncConfig({lastSyncedAt: nowISO()});
         scheduleSave();
@@ -5004,13 +5065,13 @@ async function applySyncPreview(){
   p.conflicts.forEach(c=>{
     const key = conflictKey(c);
     const choice = p.resolved[key];
-    const arr = c.type==='template' ? mergedDB.templates : c.type==='playercharacter' ? mergedDB.playerCharacters : mergedDB.campaigns;
+    const arr = c.type==='template' ? mergedDB.templates : c.type==='playercharacter' ? mergedDB.playerCharacters : c.type==='modifier' ? mergedDB.modifiers : mergedDB.campaigns;
     const idx = arr.findIndex(o=>o.id===c.id);
     if(choice==='remote'){
       if(idx>=0) arr[idx] = deepClone(c.remote);
     } else if(choice==='both'){
       const dup = deepClone(c.remote);
-      dup.id = uid(c.type==='template'?'cr':c.type==='playercharacter'?'pc':'camp');
+      dup.id = uid(c.type==='template'?'cr':c.type==='playercharacter'?'pc':c.type==='modifier'?'mod':'camp');
       dup.name = (dup.name||'Untitled') + ' (from GitHub)';
       stampSync(dup);
       arr.push(dup);
@@ -5987,6 +6048,1415 @@ function initPlayerDisplayMode(channelDeviceId){
   ch.postMessage({type:'pong'}); // announce presence immediately on open
   resize();
 }
+
+
+/* ===================================================================
+   27. CREATURE MODIFIER SYSTEM
+   A reusable, "no-code" way to take any base Creature Template and
+   layer one or more Modifiers on top of it (Undead, Elite, Weak,
+   custom homebrew, etc.) to produce a MODIFIED creature — without
+   ever touching the original template.
+
+   Design, in plain terms:
+   - A Modifier is a saved template of its own (DB.modifiers), made of
+     a list of Effects (ability changes, AC/HP/speed/save/skill
+     bonuses, attack & damage changes, resistances, added/removed
+     traits...). Effects never store an absolute replacement value for
+     ability/stat/save/skill/attack-roll math — only ADDITIVE
+     adjustments, exactly as requested ("adjustments... not
+     replacement values"). Attack damage formulas are the one place
+     replace/multiply modes make sense, and those are explicit,
+     separate, user-chosen options (never guessed).
+   - Effects that scale use one shared, pure function (evalScaling)
+     with 6 interchangeable methods, including a safe hand-written
+     formula parser (safeEvalFormula) — no eval(), no Function(),
+     no arbitrary JS execution of any kind. See that function for the
+     full description of what it accepts and rejects.
+   - computeModifiedCreature() is the single calculation pipeline: it
+     takes a base template + an ordered list of modifier ids + a
+     scaling "level" (explicitly NOT the same thing as Challenge
+     Rating — CR is left completely alone) and returns a brand-new,
+     fully independent creature object plus a breakdown of exactly
+     how every changed stat was derived, plus any warnings.
+   - That computed creature is what actually gets used — as a
+     temporary combat instance (instanceFromTemplateWithModifiers,
+     mirroring the existing instanceFromTemplate pattern exactly) or
+     saved as a reusable "variant" creature template
+     (saveCreatureVariant) that sits in the normal Creature Library
+     next to everything else, completely independent of the base
+     creature from that point on.
+   - None of this touches how templates, campaigns, encounters, or
+     the existing dice roller work; it only reads them and adds a new
+     parallel system next to them, reusing rollExpression/rollD20 for
+     actual dice rolls and the existing sync/merge engine's patterns
+     (stampSync, soft-delete, field-level merge) for its own storage.
+=================================================================== */
+
+/* ---- Data model ---- */
+function blankModifier(){
+  return {
+    id: uid('mod'),
+    name: 'New Modifier',
+    description: '',
+    icon: '', // free-text short label/emoji, purely cosmetic
+    category: '', // free-text grouping, e.g. "Undead", "Elite" — not a fixed enum
+    tags: [],
+    levelMin: null, levelMax: null, // optional scaling-level restriction
+    allowedSizes: [], allowedTypes: [], // optional restriction on which creatures may receive this (empty = no restriction)
+    stacking: 'unique', // 'unique' (default: can't add the same modifier twice to one creature) | 'stack' (duplicates allowed)
+    enabled: true,
+    effects: [], // see EFFECT_KINDS below
+    createdAt: nowISO(), updatedAt: nowISO(),
+    deviceId: getDeviceId(), version: 0, deletedAt: null,
+  };
+}
+
+/* Every effect kind this engine understands, with beginner-friendly labels
+   used directly in the modifier-builder UI. "group" is just for organizing
+   the "+ Add Effect" menu into sections that match the spec's own grouping. */
+const EFFECT_KINDS = [
+  {kind:'ability_score', group:'Ability Scores', label:'Change an Ability Score', hint:'Adds to the raw score (e.g. STR 14 → 16). This can shift the derived modifier too.'},
+  {kind:'ability_mod', group:'Ability Scores', label:'Change an Ability Modifier directly', hint:'Adds straight to the modifier (e.g. +2 to the DEX modifier) without touching the score itself.'},
+  {kind:'stat', group:'Core Stats', label:'Change a Stat (AC, HP, Speed, etc.)', hint:'A flat additive adjustment to one core stat.'},
+  {kind:'save', group:'Core Stats', label:'Change a Saving Throw', hint:'Adds a bonus/penalty to one saving throw, on top of whatever it already was.'},
+  {kind:'skill', group:'Core Stats', label:'Change a Skill Bonus', hint:'Adds a bonus/penalty to one named skill (creates it if the creature doesn’t have it yet).'},
+  {kind:'resistance', group:'Defensive', label:'Add Damage Resistance', hint:'Resistant to the selected damage type(s).'},
+  {kind:'immunity', group:'Defensive', label:'Add Damage Immunity', hint:'Immune to the selected damage type(s).'},
+  {kind:'vulnerability', group:'Defensive', label:'Add Damage Vulnerability', hint:'Vulnerable to the selected damage type(s).'},
+  {kind:'condition_immunity', group:'Defensive', label:'Add Condition Immunity', hint:'Immune to the selected condition(s).'},
+  {kind:'tempHP', group:'Defensive', label:'Grant Temporary HP', hint:'When this creature is added to an encounter, it starts with this much temporary HP.'},
+  {kind:'attack_add', group:'Offensive', label:'Add a New Attack', hint:'Adds a brand-new attack/action with its own damage formula.'},
+  {kind:'attack_remove', group:'Offensive', label:'Remove an Attack', hint:'Removes an existing attack by name (e.g. disable "Bite" after adding a ranged option).'},
+  {kind:'attack_roll', group:'Offensive', label:'Change an Attack Roll Bonus', hint:'Adds a bonus/penalty to one attack’s to-hit bonus (or every attack).'},
+  {kind:'damage', group:'Offensive', label:'Change an Attack’s Damage', hint:'Add dice, replace the dice entirely, multiply the dice, or add a flat damage bonus — you choose exactly which.'},
+  {kind:'trait_add', group:'Traits & Abilities', label:'Add a Trait', hint:'Adds a new named trait/ability with its own description.'},
+  {kind:'trait_remove', group:'Traits & Abilities', label:'Remove a Trait', hint:'Removes an existing trait by name.'},
+  {kind:'descriptive', group:'Traits & Abilities', label:'Add a Descriptive-Only Effect', hint:'For abilities too complex to calculate automatically (advantage on attacks, expanded critical range, damage reduction, extra damage vs. a creature type, bonus spellcasting...) — this adds clear reminder text to the creature’s traits instead of pretending to simulate the rule.'},
+];
+
+const STAT_TARGETS = {
+  ac: {path:'ac', label:'Armor Class'},
+  maxHP: {path:'maxHP', label:'Max Hit Points'},
+  speedWalk: {path:'speed.walk', label:'Walking Speed (ft)'},
+  speedFly: {path:'speed.fly', label:'Flying Speed (ft)'},
+  speedSwim: {path:'speed.swim', label:'Swimming Speed (ft)'},
+  speedClimb: {path:'speed.climb', label:'Climbing Speed (ft)'},
+  speedBurrow: {path:'speed.burrow', label:'Burrowing Speed (ft)'},
+  initiative: {path:'initiativeBonus', label:'Initiative (flat bonus, beyond DEX)'},
+  profBonus: {path:'profBonus', label:'Proficiency Bonus'},
+  passivePerception: {path:'senses.passivePerception', label:'Passive Perception (override baseline)'},
+  spellSaveDC: {path:'spellcasting.saveDC', label:'Spell Save DC'},
+  spellAttackBonus: {path:'spellcasting.attackBonus', label:'Spell Attack Bonus'},
+  darkvision: {path:'senses.darkvision', label:'Darkvision (ft)'},
+  blindsight: {path:'senses.blindsight', label:'Blindsight (ft)'},
+  tremorsense: {path:'senses.tremorsense', label:'Tremorsense (ft)'},
+  truesight: {path:'senses.truesight', label:'Truesight (ft)'},
+};
+const SCALING_METHODS = [
+  {id:'flat', label:'Flat (same at every level)'},
+  {id:'per_level', label:'Per level (base + per-level × level)'},
+  {id:'per_level_after_first', label:'Per level after the first (base + per-level × (level − 1))'},
+  {id:'per_prof', label:'Per proficiency bonus (base + per-level × proficiency bonus)'},
+  {id:'per_hitdie', label:'Per Hit Die (base + per-level × number of Hit Dice)'},
+  {id:'custom', label:'Custom formula (advanced)'},
+];
+
+function blankScaling(base){ return {method:'flat', base: base||0, perLevel:0, formula:''}; }
+function blankEffect(kind){
+  const id = uid('eff');
+  const common = {id, kind, enabled:true};
+  switch(kind){
+    case 'ability_score': case 'ability_mod':
+      return {...common, ability:'str', scaling: blankScaling(0)};
+    case 'stat':
+      return {...common, stat:'ac', scaling: blankScaling(0)};
+    case 'save':
+      return {...common, ability:'str', scaling: blankScaling(0)};
+    case 'skill':
+      return {...common, skillName:'', scaling: blankScaling(0)};
+    case 'resistance': case 'immunity': case 'vulnerability':
+      return {...common, damageTypes:[]};
+    case 'condition_immunity':
+      return {...common, conditions:[]};
+    case 'tempHP':
+      return {...common, scaling: blankScaling(0)};
+    case 'attack_add':
+      return {...common, targetList:'actions', name:'New Attack', usage:'', range:'', reach:'',
+        attackBonusScaling: blankScaling(0), dice:{count:1,sides:4}, diceCountScaling: blankScaling(0),
+        flatScaling: blankScaling(0), damageType:'bludgeoning', save:''};
+    case 'attack_remove':
+      return {...common, targetList:'actions', targetName:''};
+    case 'attack_roll':
+      return {...common, targetList:'actions', targetName:'', applyToAll:true, scaling: blankScaling(0)};
+    case 'damage':
+      return {...common, targetList:'actions', targetName:'', applyToAll:false, mode:'add_dice',
+        dice:{count:1,sides:4}, diceCountScaling: blankScaling(0), flatScaling: blankScaling(0),
+        multiplyBy: 2, damageType:''};
+    case 'trait_add':
+      return {...common, name:'New Trait', description:''};
+    case 'trait_remove':
+      return {...common, targetName:''};
+    case 'descriptive':
+      return {...common, subtype:'advantage_on_attacks', name:'', description:''};
+    default:
+      return {...common, scaling: blankScaling(0)};
+  }
+}
+
+/* ---- Restricted formula + dice-formula tools ----
+   Neither of these ever calls eval()/Function()/new Function(), and
+   neither executes anything beyond +,-,*,/ and parentheses on numbers
+   and a fixed whitelist of variable names. This satisfies the explicit
+   "no unrestricted eval(), no arbitrary JavaScript execution" rule. */
+function safeEvalFormula(expr, vars){
+  vars = vars || {};
+  if(typeof expr !== 'string' || !expr.trim()) return 0;
+  if(!/^[0-9a-zA-Z_.\s+\-*/().]*$/.test(expr)) throw new Error('Formula contains characters that aren’t allowed (only numbers, + - * / ( ) and the listed variable names).');
+  let pos = 0;
+  function skipWs(){ while(pos<expr.length && /\s/.test(expr[pos])) pos++; }
+  function parseExpr(){
+    let v = parseTerm();
+    for(;;){ skipWs(); const c=expr[pos];
+      if(c==='+'){ pos++; v += parseTerm(); }
+      else if(c==='-'){ pos++; v -= parseTerm(); }
+      else break;
+    }
+    return v;
+  }
+  function parseTerm(){
+    let v = parseFactor();
+    for(;;){ skipWs(); const c=expr[pos];
+      if(c==='*'){ pos++; v *= parseFactor(); }
+      else if(c==='/'){ pos++; const d=parseFactor(); if(d===0) throw new Error('Formula divides by zero.'); v /= d; }
+      else break;
+    }
+    return v;
+  }
+  function parseFactor(){
+    skipWs();
+    const c = expr[pos];
+    if(c==='+'){ pos++; return parseFactor(); }
+    if(c==='-'){ pos++; return -parseFactor(); }
+    if(c==='('){
+      pos++; const v = parseExpr(); skipWs();
+      if(expr[pos] !== ')') throw new Error('Mismatched parentheses in formula.');
+      pos++; return v;
+    }
+    const numMatch = /^[0-9]+(\.[0-9]+)?/.exec(expr.slice(pos));
+    if(numMatch){ pos += numMatch[0].length; return parseFloat(numMatch[0]); }
+    const idMatch = /^[a-zA-Z_][a-zA-Z0-9_]*/.exec(expr.slice(pos));
+    if(idMatch){
+      pos += idMatch[0].length;
+      const name = idMatch[0].toLowerCase();
+      if(!(name in vars)) throw new Error('Unknown variable "'+idMatch[0]+'" — supported variables are: '+Object.keys(vars).join(', '));
+      return Number(vars[name]) || 0;
+    }
+    throw new Error('Couldn’t understand the formula near "'+expr.slice(pos, pos+8)+'".');
+  }
+  skipWs();
+  if(pos>=expr.length) return 0;
+  const result = parseExpr();
+  skipWs();
+  if(pos !== expr.length) throw new Error('Unexpected text in formula near "'+expr.slice(pos, pos+8)+'".');
+  if(!isFinite(result)) throw new Error('That formula doesn’t produce a usable number.');
+  return result;
+}
+
+/* Parse a dice-notation formula like "2d6+3" into structured terms,
+   WITHOUT rolling anything — used so modifier effects can add to,
+   multiply, or replace a formula and print it back out as text.
+   Distinct from rollExpression() (section 5), which rolls dice. */
+function parseDiceFormula(expr){
+  expr = (expr==null?'':expr.toString()).trim().toLowerCase().replace(/\s+/g,'');
+  if(expr===''){ return {dice:[], flat:0, valid:true}; }
+  const termRe = /([+-]?)(\d*d\d+|\d+)/g;
+  let m, dice=[], flat=0, any=false, consumed=0;
+  while((m = termRe.exec(expr))){
+    any = true;
+    consumed += m[0].length;
+    const sign = m[1]==='-' ? -1 : 1;
+    const tok = m[2];
+    if(tok.indexOf('d')>=0){
+      const parts = tok.split('d');
+      const count = (parts[0]==='' ? 1 : parseInt(parts[0],10)) * sign;
+      const sides = parseInt(parts[1],10);
+      if(!sides || sides<2) return {dice:[], flat:0, valid:false};
+      dice.push({count, sides});
+    } else {
+      flat += parseInt(tok,10) * sign;
+    }
+  }
+  if(!any || consumed !== expr.length) return {dice:[], flat:0, valid:false};
+  return {dice, flat, valid:true};
+}
+function formatDiceFormula(dice, flat){
+  const bySides = {};
+  (dice||[]).forEach(d=>{ if(!d || !d.sides) return; bySides[d.sides] = (bySides[d.sides]||0) + (d.count||0); });
+  const sidesList = Object.keys(bySides).map(Number).filter(s=>bySides[s]!==0).sort((a,b)=>b-a);
+  let parts = [];
+  sidesList.forEach(s=>{
+    const c = bySides[s];
+    parts.push((parts.length ? (c>0?'+':'-') : (c<0?'-':'')) + Math.abs(c)+'d'+s);
+  });
+  flat = flat||0;
+  if(flat){ parts.push((parts.length ? (flat>0?'+':'-') : (flat<0?'-':'')) + Math.abs(flat)); }
+  if(!parts.length) return '0';
+  return parts.join('');
+}
+
+/* ---- Scaling evaluation (shared by every numeric effect) ---- */
+function evalScaling(scaling, ctx){
+  scaling = scaling || blankScaling(0);
+  ctx = ctx || {};
+  const level = Number(ctx.level)||0;
+  const prof = Number(ctx.prof)||0;
+  const hitDice = Number(ctx.hitDice)||0;
+  const base = Number(scaling.base)||0;
+  const perLevel = Number(scaling.perLevel)||0;
+  switch(scaling.method){
+    case 'flat': return base;
+    case 'per_level': return base + perLevel*level;
+    case 'per_level_after_first': return base + perLevel*Math.max(0, level-1);
+    case 'per_prof': return base + perLevel*prof;
+    case 'per_hitdie': return base + perLevel*hitDice;
+    case 'custom':
+      return safeEvalFormula(scaling.formula, {level, prof, hitdice:hitDice, hitdie:hitDice, base, perlevel:perLevel});
+    default: return base;
+  }
+}
+function describeScaling(scaling){
+  scaling = scaling || blankScaling(0);
+  const m = SCALING_METHODS.find(x=>x.id===scaling.method);
+  const label = m ? m.label.split(' (')[0] : scaling.method;
+  if(scaling.method==='flat') return `${fmtMod(scaling.base||0)} flat`;
+  if(scaling.method==='custom') return `custom formula: ${scaling.formula||'(empty)'}`;
+  return `${fmtMod(scaling.base||0)} base, ${fmtMod(scaling.perLevel||0)} ${label.toLowerCase()}`;
+}
+
+function getPathSafe(obj, path){ return path.split('.').reduce((o,k)=> (o===undefined||o===null)?undefined:o[k], obj); }
+function setPathSafe(obj, path, value){
+  const keys = path.split('.'); let cur = obj;
+  for(let i=0;i<keys.length-1;i++){ if(cur[keys[i]]===undefined||cur[keys[i]]===null) cur[keys[i]]={}; cur = cur[keys[i]]; }
+  cur[keys[keys.length-1]] = value;
+}
+function splitList(str){ return (str||'').split(',').map(s=>s.trim()).filter(Boolean); }
+function joinList(arr){ return arr.join(', '); }
+
+/* Record one adjustment in the human-readable breakdown, keyed by a
+   stable stat key. Purely additive stats (ability scores/mods, AC, HP,
+   speeds, saves, skills, attack-roll bonuses, senses, proficiency
+   bonus, spell DC/attack, passive perception) all funnel through here
+   so the final Apply-Modifiers preview can show base -> adjustments ->
+   final for every stat a modifier touched, per spec section 6. */
+function recordAdjustment(breakdown, key, label, baseValue, source, value){
+  if(!breakdown[key]) breakdown[key] = {label, base: baseValue, adjustments: [], final: baseValue};
+  breakdown[key].adjustments.push({source, value});
+  breakdown[key].final = (breakdown[key].final||0) + value;
+}
+function recordNote(breakdown, key, label, text){
+  if(!breakdown[key]) breakdown[key] = {label, textOnly:true, notes:[]};
+  breakdown[key].notes.push(text);
+}
+
+/* Apply ONE effect to the working creature in place. `seenTargets` is a
+   per-computation Map used only to flag replace/remove conflicts for
+   the warnings list (e.g. two modifiers both trying to replace the
+   same attack's damage) — it never blocks the calculation, it only
+   reports it, per "effects that conflict should produce a warning". */
+function applyEffectToWorking(working, effect, ctx, breakdown, warnings, modifierName, seenTargets){
+  seenTargets = seenTargets || {};
+  if(!effect || effect.enabled===false) return;
+  const level = ctx.level, prof = Number(working.profBonus)||0;
+  const hdParsed = parseDiceFormula(working.hitDice||'');
+  const hitDice = hdParsed.valid ? hdParsed.dice.reduce((n,d)=>n+(d.count>0?d.count:0),0) : 0;
+  const fullCtx = {level, prof, hitDice};
+
+  try{
+    switch(effect.kind){
+      case 'ability_score': {
+        const ab = effect.ability;
+        if(!working.abilities[ab]){ warnings.push(`${modifierName}: unknown ability "${ab}" — skipped.`); return; }
+        const delta = evalScaling(effect.scaling, fullCtx);
+        const before = Number(working.abilities[ab].score)||0;
+        working.abilities[ab].score = before + delta;
+        recordAdjustment(breakdown, 'ability_score_'+ab, ABIL_LABEL[ab]+' Score', before, modifierName, delta);
+        break;
+      }
+      case 'ability_mod': {
+        const ab = effect.ability;
+        if(!working.abilities[ab]){ warnings.push(`${modifierName}: unknown ability "${ab}" — skipped.`); return; }
+        const delta = evalScaling(effect.scaling, fullCtx);
+        const baselineMod = (working.abilities[ab].modOverride!==null && working.abilities[ab].modOverride!==undefined && working.abilities[ab].modOverride!=='')
+          ? Number(working.abilities[ab].modOverride) : abilityMod(working.abilities[ab].score);
+        working.abilities[ab].modOverride = baselineMod + delta;
+        recordAdjustment(breakdown, 'ability_mod_'+ab, ABIL_LABEL[ab]+' Modifier', baselineMod, modifierName, delta);
+        break;
+      }
+      case 'stat': {
+        const t = STAT_TARGETS[effect.stat];
+        if(!t){ warnings.push(`${modifierName}: unknown stat target "${effect.stat}" — skipped.`); return; }
+        const delta = evalScaling(effect.scaling, fullCtx);
+        const before = Number(getPathSafe(working, t.path));
+        const baseVal = isFinite(before) ? before : 0;
+        setPathSafe(working, t.path, baseVal + delta);
+        recordAdjustment(breakdown, 'stat_'+effect.stat, t.label, baseVal, modifierName, delta);
+        break;
+      }
+      case 'save': {
+        const ab = effect.ability;
+        if(!working.saves[ab]){ warnings.push(`${modifierName}: unknown ability "${ab}" — skipped.`); return; }
+        const delta = evalScaling(effect.scaling, fullCtx);
+        working._saveBonusAccum = working._saveBonusAccum || {};
+        working._saveBonusAccum[ab] = (working._saveBonusAccum[ab]||0) + delta;
+        recordAdjustment(breakdown, 'save_'+ab, ABIL_LABEL[ab]+' Save', 0, modifierName, delta);
+        break;
+      }
+      case 'skill': {
+        const name = (effect.skillName||'').trim().toLowerCase();
+        if(!name){ warnings.push(`${modifierName}: a Skill effect has no skill name set — skipped.`); return; }
+        const delta = evalScaling(effect.scaling, fullCtx);
+        let s = working.skills.find(x=>(x.name||'').toLowerCase()===name);
+        let before = 0;
+        if(!s){
+          const skillDef = SKILLS.find(sk=>sk[0]===name);
+          before = skillDef ? getAbilMod(working, skillDef[1]) : 0;
+          s = {id:uid('sk'), name, bonus:before, custom:true};
+          working.skills.push(s);
+        } else { before = Number(s.bonus)||0; }
+        s.bonus = before + delta;
+        recordAdjustment(breakdown, 'skill_'+name, name.replace(/\b\w/g,c=>c.toUpperCase()), before, modifierName, delta);
+        break;
+      }
+      case 'resistance': case 'immunity': case 'vulnerability': {
+        const field = effect.kind==='resistance' ? 'resistances' : effect.kind==='immunity' ? 'immunities' : 'vulnerabilities';
+        const existing = splitList(working[field]);
+        const add = (effect.damageTypes||[]).filter(t=>t && existing.indexOf(t)<0);
+        working[field] = joinList(existing.concat(add));
+        if(add.length) recordNote(breakdown, field, field.charAt(0).toUpperCase()+field.slice(1), `${modifierName} added: ${add.join(', ')}`);
+        break;
+      }
+      case 'condition_immunity': {
+        const existing = working.conditionImmunities||[];
+        const add = (effect.conditions||[]).filter(c=>c && existing.indexOf(c)<0);
+        working.conditionImmunities = existing.concat(add);
+        if(add.length) recordNote(breakdown, 'conditionImmunities', 'Condition Immunities', `${modifierName} added: ${add.join(', ')}`);
+        break;
+      }
+      case 'tempHP': {
+        const delta = evalScaling(effect.scaling, fullCtx);
+        working._tempHPGrant = (working._tempHPGrant||0) + delta;
+        recordAdjustment(breakdown, 'tempHP', 'Temporary HP (on add to encounter)', 0, modifierName, delta);
+        break;
+      }
+      case 'attack_add': {
+        const list = working[effect.targetList] || (working[effect.targetList]=[]);
+        const atkBonus = Math.round(evalScaling(effect.attackBonusScaling, fullCtx));
+        const diceCount = Math.max(0, Math.round((effect.dice&&effect.dice.count||0) + evalScaling(effect.diceCountScaling, fullCtx)));
+        const flat = Math.round(evalScaling(effect.flatScaling, fullCtx));
+        const diceStr = diceCount>0 ? formatDiceFormula([{count:diceCount, sides:(effect.dice&&effect.dice.sides)||4}], flat) : (flat? String(flat) : '');
+        const newAction = {
+          id: uid('e'), name: effect.name||'New Attack', description: `Added by modifier "${modifierName}".`,
+          usage: effect.usage||'', attackBonus: diceStr||flat||atkBonus ? fmtMod(atkBonus) : '',
+          range: effect.range||'', reach: effect.reach||'', damageDice: diceStr, damageType: effect.damageType||'',
+          save: effect.save||'', _fromModifier: modifierName,
+        };
+        list.push(newAction);
+        recordNote(breakdown, 'attack_'+newAction.name, newAction.name, `${modifierName} added this attack: ${fmtMod(atkBonus)} to hit, ${diceStr||'no'} ${effect.damageType||''} damage.`.trim());
+        break;
+      }
+      case 'attack_remove': {
+        const list = working[effect.targetList] || [];
+        const target = (effect.targetName||'').trim().toLowerCase();
+        if(!target){ warnings.push(`${modifierName}: Remove Attack effect has no target name set — skipped.`); return; }
+        const before = list.length;
+        working[effect.targetList] = list.filter(a=>(a.name||'').trim().toLowerCase()!==target);
+        if(working[effect.targetList].length===before){
+          warnings.push(`${modifierName}: tried to remove attack "${effect.targetName}" but no attack with that name was found.`);
+        } else {
+          recordNote(breakdown, 'attack_removed_'+target, effect.targetName, `${modifierName} removed this attack.`);
+        }
+        break;
+      }
+      case 'attack_roll': {
+        const lists = ['actions','bonusActions','reactions'];
+        const delta = Math.round(evalScaling(effect.scaling, fullCtx));
+        let touched = 0;
+        lists.forEach(listName=>{
+          (working[listName]||[]).forEach(a=>{
+            if(!effect.applyToAll && (a.name||'').trim().toLowerCase() !== (effect.targetName||'').trim().toLowerCase()) return;
+            if(effect.applyToAll && effect.targetList && effect.targetList!==listName) return;
+            const m = /^([+-]?\d+)/.exec((a.attackBonus||'').trim());
+            const before = m ? parseInt(m[1],10) : 0;
+            a.attackBonus = fmtMod(before + delta);
+            touched++;
+            recordAdjustment(breakdown, 'attackroll_'+a.name, 'Attack Roll: '+a.name, before, modifierName, delta);
+          });
+        });
+        if(!touched) warnings.push(`${modifierName}: Attack Roll effect didn’t match any attack (check the target name).`);
+        break;
+      }
+      case 'damage': {
+        const key = effect.targetList || 'actions';
+        const targetKeyLower = (effect.targetName||'').trim().toLowerCase();
+        const pool = effect.applyToAll ? (working[key]||[]) : (working[key]||[]).filter(a=>(a.name||'').trim().toLowerCase()===targetKeyLower);
+        if(!pool.length){
+          warnings.push(`${modifierName}: Damage effect didn’t match any attack named "${effect.targetName}".`);
+          return;
+        }
+        pool.forEach(a=>{
+          const before = a.damageDice||'';
+          const parsedBefore = parseDiceFormula(before);
+          const diceCount = Math.max(0, Math.round((effect.dice&&effect.dice.count||0) + evalScaling(effect.diceCountScaling, fullCtx)));
+          const flatDelta = Math.round(evalScaling(effect.flatScaling, fullCtx));
+          const dupKey = key+'::'+(a.name||'')+'::replace';
+          let after;
+          if(effect.mode==='replace_dice'){
+            if(seenTargets[dupKey]) warnings.push(`${modifierName}: another modifier already replaced "${a.name}"'s damage — this one’s replacement wins instead (last applied, per stacking order).`);
+            seenTargets[dupKey] = modifierName;
+            after = formatDiceFormula(diceCount>0?[{count:diceCount, sides:(effect.dice&&effect.dice.sides)||4}]:[], flatDelta);
+          } else if(effect.mode==='add_dice'){
+            const dice = parsedBefore.valid ? parsedBefore.dice.slice() : [];
+            if(diceCount>0) dice.push({count:diceCount, sides:(effect.dice&&effect.dice.sides)||4});
+            after = formatDiceFormula(dice, (parsedBefore.valid?parsedBefore.flat:0) + flatDelta);
+          } else if(effect.mode==='multiply_dice'){
+            const factor = effect.multiplyBy || 1;
+            const dice = parsedBefore.valid ? parsedBefore.dice.map(d=>({count: Math.round(d.count*factor), sides:d.sides})) : [];
+            after = formatDiceFormula(dice, (parsedBefore.valid?parsedBefore.flat:0) + flatDelta);
+          } else if(effect.mode==='flat_bonus'){
+            const dice = parsedBefore.valid ? parsedBefore.dice : [];
+            after = formatDiceFormula(dice, (parsedBefore.valid?parsedBefore.flat:0) + flatDelta);
+          } else if(effect.mode==='multiply_total'){
+            // Can't be pre-baked into a dice string (it multiplies the ROLLED total, not the formula).
+            // Stored as a roll-time multiplier the existing roll functions apply after rolling.
+            a._dmgMultiplier = (a._dmgMultiplier||1) * (effect.multiplyBy||1);
+            after = before + ' (×'+(a._dmgMultiplier)+' on roll)';
+          } else {
+            after = before;
+          }
+          if(effect.mode!=='multiply_total') a.damageDice = after;
+          if(effect.damageType) a.damageType = effect.damageType;
+          recordNote(breakdown, 'damage_'+(a.name||''), 'Damage: '+(a.name||'(attack)'), `${modifierName}: ${before||'(none)'} → ${after}`);
+        });
+        break;
+      }
+      case 'trait_add': {
+        working.traits = working.traits || [];
+        working.traits.push({id:uid('e'), name:effect.name||'New Trait', description: effect.description||'', usage:'', _fromModifier: modifierName});
+        recordNote(breakdown, 'trait_'+effect.name, effect.name, `${modifierName} added this trait.`);
+        break;
+      }
+      case 'trait_remove': {
+        const target = (effect.targetName||'').trim().toLowerCase();
+        if(!target){ warnings.push(`${modifierName}: Remove Trait effect has no target name set — skipped.`); return; }
+        const before = (working.traits||[]).length;
+        working.traits = (working.traits||[]).filter(t=>(t.name||'').trim().toLowerCase()!==target);
+        if(working.traits.length===before) warnings.push(`${modifierName}: tried to remove trait "${effect.targetName}" but it wasn’t found.`);
+        else recordNote(breakdown, 'trait_removed_'+target, effect.targetName, `${modifierName} removed this trait.`);
+        break;
+      }
+      case 'descriptive': {
+        const label = (DESCRIPTIVE_SUBTYPES.find(d=>d.id===effect.subtype)||{}).label || 'Special Effect';
+        working.traits = working.traits || [];
+        working.traits.push({id:uid('e'), name: effect.name || label, description: (effect.description? effect.description+' ' : '') + '(Added by modifier "'+modifierName+'". This is informational only — Warden does not automatically apply it during rolls.)', usage:'', _fromModifier: modifierName, _descriptiveOnly:true});
+        recordNote(breakdown, 'descriptive_'+effect.id, effect.name||label, `${modifierName}: ${effect.description||label} (not mechanically automated)`);
+        break;
+      }
+      default:
+        warnings.push(`${modifierName}: unknown effect type "${effect.kind}" — skipped.`);
+    }
+  }catch(err){
+    warnings.push(`${modifierName}: effect error — ${err.message}`);
+  }
+}
+const DESCRIPTIVE_SUBTYPES = [
+  {id:'advantage_on_attacks', label:'Advantage on Attack Rolls'},
+  {id:'crit_range', label:'Expanded Critical Hit Range'},
+  {id:'extra_damage_vs_type', label:'Extra Damage vs. a Creature Type'},
+  {id:'damage_reduction', label:'Damage Reduction'},
+  {id:'extra_crit_damage', label:'Additional Damage on Critical Hits'},
+  {id:'bonus_spellcasting', label:'Bonus Spellcasting / Special Ability'},
+  {id:'other', label:'Other'},
+];
+
+/* ---- The calculation pipeline ---- */
+function computeModifiedCreature(baseTemplate, modifierIds, level){
+  const working = deepClone(baseTemplate);
+  delete working.isVariant; delete working.baseTemplateId; delete working.variantModifierIds; delete working.variantLevel;
+  const breakdown = {};
+  const warnings = [];
+  const seenTargets = {};
+  level = Number(level)||1;
+
+  const mods = (modifierIds||[]).map(id=>getModifierAny(id)).filter(Boolean);
+  const seenIds = {};
+  mods.forEach(mod=>{
+    if(mod.deletedAt){ warnings.push(`"${mod.name}" has been deleted and was skipped.`); return; }
+    if(mod.enabled===false){ warnings.push(`"${mod.name}" is disabled and was skipped.`); return; }
+    if(mod.stacking!=='stack' && seenIds[mod.id]){ warnings.push(`"${mod.name}" was selected more than once; it only allows one copy, so the duplicate was skipped.`); return; }
+    seenIds[mod.id] = (seenIds[mod.id]||0)+1;
+    if(mod.levelMin!==null && mod.levelMin!==undefined && mod.levelMin!=='' && level<Number(mod.levelMin)) warnings.push(`"${mod.name}" is meant for level ${mod.levelMin}+ but was applied at level ${level}.`);
+    if(mod.levelMax!==null && mod.levelMax!==undefined && mod.levelMax!=='' && level>Number(mod.levelMax)) warnings.push(`"${mod.name}" is meant for level ${mod.levelMax} or below but was applied at level ${level}.`);
+    (mod.effects||[]).forEach(eff=> applyEffectToWorking(working, eff, {level}, breakdown, warnings, mod.name, seenTargets));
+  });
+
+  // Finalize accumulated save bonuses now that abilities/profBonus for this computation are settled.
+  if(working._saveBonusAccum){
+    Object.keys(working._saveBonusAccum).forEach(ab=>{
+      const bonus = working._saveBonusAccum[ab];
+      const s = working.saves[ab];
+      const baseline = (s.customBonus!==null && s.customBonus!==undefined && s.customBonus!=='')
+        ? Number(s.customBonus) : (getAbilMod(working, ab) + (s.proficient ? (Number(working.profBonus)||0) : 0));
+      s.customBonus = baseline + bonus;
+      if(breakdown['save_'+ab]) breakdown['save_'+ab].base = baseline;
+      if(breakdown['save_'+ab]) breakdown['save_'+ab].final = baseline + bonus;
+    });
+    delete working._saveBonusAccum;
+  }
+
+  const grantedTempHP = working._tempHPGrant || 0;
+  delete working._tempHPGrant;
+
+  return { creature: working, breakdown, warnings, grantedTempHP, level, modifierIds: mods.map(m=>m.id) };
+}
+
+/* ---- Modifier CRUD (mirrors template CRUD exactly) ---- */
+function getModifier(id){ return (DB.modifiers||[]).find(m=>m.id===id && !m.deletedAt); }
+function getModifierAny(id){ return (DB.modifiers||[]).find(m=>m.id===id); }
+function activeModifiers(){ return (DB.modifiers||[]).filter(m=>!m.deletedAt); }
+function saveModifier(mod){
+  stampSync(mod);
+  const i = (DB.modifiers||[]).findIndex(m=>m.id===mod.id);
+  if(i>=0) DB.modifiers[i]=mod; else DB.modifiers.push(mod);
+  scheduleSave();
+}
+function deleteModifier(id){
+  const m = getModifierAny(id);
+  if(!m) return;
+  m.deletedAt = nowISO();
+  stampSync(m);
+  scheduleSave();
+}
+function duplicateModifier(id, newName){
+  const src = getModifier(id);
+  if(!src) return null;
+  const copy = deepClone(src);
+  copy.id = uid('mod');
+  copy.name = newName || (src.name + ' (Copy)');
+  copy.createdAt = nowISO(); copy.updatedAt = nowISO();
+  copy.deviceId = getDeviceId(); copy.version = 0; copy.deletedAt = null;
+  DB.modifiers.push(copy);
+  scheduleSave();
+  return copy;
+}
+
+/* ---- Encounter integration: build a combat participant from a
+   template + a chosen set of modifiers + a scaling level. Mirrors
+   instanceFromTemplate exactly (independent deep copy, own HP
+   history, conditions, etc.) — the only difference is that it starts
+   from the COMPUTED creature instead of the raw template, and it
+   remembers the recipe + a frozen baseline so the DM can toggle
+   individual modifiers on/off later without re-reading the (possibly
+   since-edited) library template. ---- */
+function instanceFromTemplateWithModifiers(tpl, modifierIds, level, indexLabel){
+  const { creature, breakdown, warnings, grantedTempHP } = computeModifiedCreature(tpl, modifierIds, level);
+  const inst = instanceFromTemplate(creature, indexLabel);
+  inst.templateId = tpl.id; // keep pointing at the real base template, not the throwaway computed copy
+  inst.templateName = tpl.name;
+  inst.tempHP = (inst.tempHP||0) + grantedTempHP;
+  if(STAT_TARGETS.initiative && creature.initiativeBonus) inst.initiativeMod = (inst.initiativeMod||0) + Number(creature.initiativeBonus||0);
+  inst.sourceModifiers = { modifierIds: (modifierIds||[]).slice(), originalModifierIds: (modifierIds||[]).slice(), level: Number(level)||1, baselineTemplate: deepClone(tpl) };
+  inst.modifierBreakdown = breakdown;
+  inst.modifierWarnings = warnings;
+  return inst;
+}
+
+/* Recompute a live combat participant's stats from its frozen baseline
+   template + a (possibly changed) subset of its originally-applied
+   modifiers — used when the DM toggles a modifier on/off mid-combat.
+   HP is shifted by the same delta the recompute causes to Max HP, so
+   toggling a +10 Max HP modifier also adjusts current HP by +10
+   rather than silently resetting it to full. */
+function recomputeParticipantModifiers(participant, activeModifierIds){
+  if(!participant.sourceModifiers || !participant.sourceModifiers.baselineTemplate) return;
+  const { creature, breakdown, warnings, grantedTempHP } = computeModifiedCreature(
+    participant.sourceModifiers.baselineTemplate, activeModifierIds, participant.sourceModifiers.level);
+  const oldMax = participant.maxHPOverride!=null ? Number(participant.maxHPOverride) : Number(participant.maxHP)||0;
+  const newMax = Number(creature.maxHP)||0;
+  const delta = newMax - oldMax;
+  // Preserve everything about the live instance except the fields the modifier system actually computes.
+  ['name'].forEach(()=>{}); // (name is intentionally left alone — DM may have renamed this instance)
+  participant.ac = creature.ac;
+  participant.maxHP = creature.maxHP;
+  participant.speed = creature.speed;
+  participant.abilities = creature.abilities;
+  participant.saves = creature.saves;
+  participant.skills = creature.skills;
+  participant.resistances = creature.resistances;
+  participant.immunities = creature.immunities;
+  participant.vulnerabilities = creature.vulnerabilities;
+  participant.conditionImmunities = creature.conditionImmunities;
+  participant.senses = creature.senses;
+  participant.traits = creature.traits;
+  participant.actions = creature.actions;
+  participant.bonusActions = creature.bonusActions;
+  participant.reactions = creature.reactions;
+  participant.profBonus = creature.profBonus;
+  participant.spellcasting = creature.spellcasting;
+  if(participant.currentHP!==null && participant.currentHP!==undefined) participant.currentHP = Math.max(0, participant.currentHP + delta);
+  participant.sourceModifiers.modifierIds = activeModifierIds.slice();
+  participant.modifierBreakdown = breakdown;
+  participant.modifierWarnings = warnings;
+  return { breakdown, warnings, hpDelta: delta };
+}
+
+/* ---- Library integration: save a computed creature as a reusable,
+   independent Variant (never overwrites the base creature). ---- */
+function saveCreatureVariant(baseTemplate, modifierIds, level, variantName){
+  const { creature } = computeModifiedCreature(baseTemplate, modifierIds, level);
+  creature.id = uid('cr');
+  creature.name = variantName || (baseTemplate.name + ' (Modified)');
+  creature.favorite = false;
+  creature.isVariant = true;
+  creature.baseTemplateId = baseTemplate.id;
+  creature.variantModifierIds = (modifierIds||[]).slice();
+  creature.variantLevel = Number(level)||1;
+  creature.createdAt = nowISO(); creature.updatedAt = nowISO();
+  creature.deviceId = getDeviceId(); creature.version = 0; creature.deletedAt = null;
+  DB.templates.push(creature);
+  scheduleSave();
+  return creature;
+}
+/* Explicitly re-derive a variant from its (possibly since-edited) base
+   template + its saved modifier list/level. This is the ONLY way a
+   variant's computed fields ever change after being saved — editing
+   the base template never silently touches existing variants, per
+   spec section 8 ("do not silently overwrite their saved custom
+   changes"). Any manual edits the user made directly to the variant's
+   computed fields (AC, actions, etc.) ARE overwritten by this —
+   that's the whole point of "recompute" and the UI warns about it
+   before calling this. */
+function recomputeVariant(variantId){
+  const variant = getTemplate(variantId);
+  if(!variant || !variant.isVariant) return null;
+  const base = getTemplateAny(variant.baseTemplateId);
+  if(!base){ return null; }
+  const { creature, warnings } = computeModifiedCreature(base, variant.variantModifierIds, variant.variantLevel);
+  const keep = {id:variant.id, name:variant.name, favorite:variant.favorite, tags:variant.tags, notes:variant.notes,
+    isVariant:true, baseTemplateId:variant.baseTemplateId, variantModifierIds:variant.variantModifierIds, variantLevel:variant.variantLevel,
+    createdAt:variant.createdAt, inventory:variant.inventory, customFields:variant.customFields};
+  Object.assign(variant, creature, keep);
+  stampSync(variant);
+  scheduleSave();
+  return { variant, warnings };
+}
+
+/* ---------------------------------------------------------------
+   27b. MODIFIER LIBRARY PAGE
+--------------------------------------------------------------- */
+UI.modifierLibrary = { search:'', tagFilter:null };
+function viewModifiers(){
+  const st = UI.modifierLibrary;
+  let list = activeModifiers();
+  if(st.tagFilter) list = list.filter(m=>(m.tags||[]).includes(st.tagFilter));
+  if(st.search.trim()){
+    const q = st.search.trim().toLowerCase();
+    list = list.filter(m=> (m.name||'').toLowerCase().includes(q) || (m.category||'').toLowerCase().includes(q) || (m.tags||[]).some(tg=>tg.toLowerCase().includes(q)));
+  }
+  list = list.slice().sort((a,b)=>(a.name||'').localeCompare(b.name||''));
+  const allTags = Array.from(new Set(activeModifiers().flatMap(m=>m.tags||[]))).sort();
+  return `
+    <div class="card mb14">
+      <p class="muted small mb10">Modifiers are reusable templates (Undead, Elite, Weak, or anything custom) you can layer onto any creature to produce a modified version of it — without ever changing the original. Build one from scratch, or add a few starting examples below.</p>
+      <div class="combat-toolbar" style="position:static;">
+        <div class="search-bar">
+          <span class="si">&#128269;</span>
+          <input type="search" placeholder="Search modifiers…" value="${esc(st.search)}" oninput="UI.modifierLibrary.search=this.value;render();">
+        </div>
+        <div class="nav-spacer"></div>
+        <button class="btn" onclick="installExampleModifiers()">Add Example Modifiers</button>
+        <button class="btn btn-primary" onclick="openModifierEditorModal(null)">&#10010; New Modifier</button>
+      </div>
+      ${allTags.length?`<div class="tag-list mt10">
+        <span class="pill ${!st.tagFilter?'pill-gold':''}" style="cursor:pointer;" onclick="UI.modifierLibrary.tagFilter=null;render();">All</span>
+        ${allTags.map(tg=>`<span class="pill ${st.tagFilter===tg?'pill-gold':''}" style="cursor:pointer;" onclick="UI.modifierLibrary.tagFilter='${esc(tg)}';render();">${esc(tg)}</span>`).join('')}
+      </div>`:''}
+    </div>
+    ${list.length ? `<div class="grid-cards">${list.map(modifierCardHTML).join('')}</div>`
+      : `<div class="empty"><div class="glyph">&#9889;</div><h3>No modifiers yet</h3><p class="small">Create one, or add the built-in examples to get started.</p></div>`}
+  `;
+}
+function modifierCardHTML(m){
+  const effCount = (m.effects||[]).length;
+  return `
+    <div class="creature-card">
+      <div onclick="openModifierEditorModal('${m.id}')">
+        <div class="cc-head">
+          <div>
+            <div class="cc-name">${m.icon?esc(m.icon)+' ':''}${esc(m.name)}</div>
+            <div class="cc-meta">${esc(m.category||'Custom')} · ${effCount} effect${effCount===1?'':'s'}${m.enabled===false?' · <span style="color:var(--blood-bright)">Disabled</span>':''}</div>
+          </div>
+        </div>
+        ${m.description?`<p class="small muted" style="margin:4px 0 0;">${esc(m.description.slice(0,110))}${m.description.length>110?'…':''}</p>`:''}
+        ${m.tags&&m.tags.length?`<div class="tag-list">${m.tags.slice(0,4).map(tg=>`<span class="pill">${esc(tg)}</span>`).join('')}</div>`:''}
+      </div>
+      <div class="btn-row" style="margin-top:2px;">
+        <button class="btn btn-xs" onclick="event.stopPropagation();quickDuplicateModifier('${m.id}')">Duplicate</button>
+        <button class="btn btn-xs" onclick="event.stopPropagation();exportSingle('modifier','${m.id}')">Export</button>
+        <button class="btn btn-xs btn-danger" onclick="event.stopPropagation();confirmDeleteModifier('${m.id}')">Delete</button>
+      </div>
+    </div>`;
+}
+function quickDuplicateModifier(id){ const m=duplicateModifier(id); toast('Duplicated as "'+m.name+'"'); render(); }
+window.quickDuplicateModifier = quickDuplicateModifier;
+function confirmDeleteModifier(id){
+  const m = getModifier(id); if(!m) return;
+  openConfirmModal({ title:'Delete modifier?', danger:true, confirmLabel:'Delete Permanently',
+    body:`"${esc(m.name)}" will be removed from your library. Creatures and saved variants that already used it keep their computed stats — nothing already in an encounter or a saved variant is affected.`,
+    onConfirm:()=>{ deleteModifier(id); toast('Deleted "'+m.name+'"'); render(); } });
+}
+window.confirmDeleteModifier = confirmDeleteModifier;
+
+function installExampleModifiers(){
+  const existingNames = activeModifiers().map(m=>m.name.toLowerCase());
+  const examples = [
+    (()=>{ const m=blankModifier(); m.name='Undead'; m.category='Undead'; m.icon='☠'; m.tags=['undead','example'];
+      m.description='A basic undead toughening: colder presence, no need to breathe or feel pain, but no personality to speak of.';
+      m.effects=[
+        {...blankEffect('ability_mod'), ability:'cha', scaling:{method:'per_level', base:-4, perLevel:-1, formula:''}},
+        {...blankEffect('ability_mod'), ability:'dex', scaling:{method:'per_level', base:2, perLevel:1, formula:''}},
+        {...blankEffect('immunity'), damageTypes:['poison']},
+        {...blankEffect('condition_immunity'), conditions:['Poisoned','Exhaustion']},
+      ]; return m; })(),
+    (()=>{ const m=blankModifier(); m.name='Elite'; m.category='Elite'; m.icon='★'; m.tags=['elite','example'];
+      m.description='A tougher, harder-hitting version of a standard creature — more HP, better AC, and stronger attacks.';
+      m.effects=[
+        {...blankEffect('stat'), stat:'maxHP', scaling:{method:'per_level', base:10, perLevel:5, formula:''}},
+        {...blankEffect('stat'), stat:'ac', scaling:{method:'flat', base:2, perLevel:0, formula:''}},
+        {...blankEffect('attack_roll'), applyToAll:true, scaling:{method:'flat', base:1, perLevel:0, formula:''}},
+      ]; return m; })(),
+    (()=>{ const m=blankModifier(); m.name='Weak'; m.category='Weak'; m.icon='↓'; m.tags=['weak','example'];
+      m.description='A frailer, easier version of a standard creature — for an easier encounter without re-building the whole stat block.';
+      m.effects=[
+        {...blankEffect('stat'), stat:'maxHP', scaling:{method:'per_level', base:-5, perLevel:-2, formula:''}},
+        {...blankEffect('stat'), stat:'ac', scaling:{method:'flat', base:-1, perLevel:0, formula:''}},
+      ]; return m; })(),
+  ];
+  let added = 0;
+  examples.forEach(m=>{ if(existingNames.indexOf(m.name.toLowerCase())<0){ DB.modifiers.push(m); added++; } });
+  if(added){ scheduleSave(); toast(`Added ${added} example modifier${added===1?'':'s'}`); render(); }
+  else toast('Example modifiers are already in your library.');
+}
+window.installExampleModifiers = installExampleModifiers;
+
+/* ---------------------------------------------------------------
+   27c. MODIFIER EDITOR (no-code effect builder)
+--------------------------------------------------------------- */
+let MODEDIT = null; // {draft, isNew, originalId, expandedId}
+function openModifierEditorModal(id){
+  const existing = id ? getModifier(id) : null;
+  MODEDIT = { draft: existing ? deepClone(existing) : blankModifier(), isNew: !existing, originalId: id||null, expandedId: null };
+  pushModal({ key:'modifier-editor', size:'xl', noClickAway:true, render: renderModifierEditorModal });
+}
+window.openModifierEditorModal = openModifierEditorModal;
+function modDraftSet(path, value){ setPathSafe(MODEDIT.draft, path, value); }
+function modDraftSetNum(path, value){ setPathSafe(MODEDIT.draft, path, value===''||value===null||value===undefined?null:Number(value)); }
+window.modDraftSet = modDraftSet; window.modDraftSetNum = modDraftSetNum;
+function modArrPush(path, obj){ const arr = getPathSafe(MODEDIT.draft, path)||[]; arr.push(obj); setPathSafe(MODEDIT.draft, path, arr); }
+function modArrRemoveAt(path, i){ const arr = getPathSafe(MODEDIT.draft, path)||[]; arr.splice(i,1); setPathSafe(MODEDIT.draft, path, arr); }
+function modChipsHTML(path, arr){
+  arr = arr||[];
+  const safe = path.replace(/\./g,'-');
+  return `<div class="tag-list mb6">
+      ${arr.map((t,i)=>`<span class="pill">${esc(t)}<button onclick="modArrRemoveAt('${path}',${i});updateModEditorBody();">&times;</button></span>`).join('')}
+    </div>
+    <div class="flex gap6">
+      <input type="text" id="modchip-${safe}" placeholder="Add and press Enter" style="max-width:220px;"
+        onkeydown="if(event.key==='Enter'){event.preventDefault(); modAddChip('${path}', this);}">
+      <button class="btn btn-sm" onclick="modAddChip('${path}', document.getElementById('modchip-${safe}'))">Add</button>
+    </div>`;
+}
+function modAddChip(path, input){
+  const v = input.value.trim(); if(!v) return;
+  const arr = getPathSafe(MODEDIT.draft, path)||[];
+  if(arr.indexOf(v)<0) arr.push(v);
+  setPathSafe(MODEDIT.draft, path, arr);
+  input.value=''; updateModEditorBody();
+}
+window.modAddChip = modAddChip;
+function updateModEditorBody(){
+  const el = document.getElementById('modedit-body');
+  if(el) el.innerHTML = modifierEditorBodyHTML();
+  else renderModals();
+}
+window.updateModEditorBody = updateModEditorBody;
+
+function renderModifierEditorModal(){
+  const d = MODEDIT.draft;
+  return `
+    <div class="modal-head"><h2>${MODEDIT.isNew?'New':'Edit'} Modifier</h2><button class="modal-close" onclick="closeModifierEditor()">&times;</button></div>
+    <div class="modal-body" id="modedit-body">${modifierEditorBodyHTML()}</div>
+    <div class="modal-foot">
+      ${!MODEDIT.isNew?`<button class="btn btn-danger" style="margin-right:auto;" onclick="confirmDeleteModifier('${MODEDIT.originalId}');closeAllModals();">Delete</button>`:''}
+      <button class="btn" onclick="closeModifierEditor()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveModifierFromEditor()">Save Modifier</button>
+    </div>`;
+}
+function closeModifierEditor(){ MODEDIT=null; popModal(); }
+window.closeModifierEditor = closeModifierEditor;
+function saveModifierFromEditor(){
+  if(!MODEDIT.draft.name || !MODEDIT.draft.name.trim()){ toast('Give this modifier a name first.', true); return; }
+  saveModifier(MODEDIT.draft);
+  toast('Saved "'+MODEDIT.draft.name+'"');
+  MODEDIT = null;
+  popModal();
+  render();
+}
+window.saveModifierFromEditor = saveModifierFromEditor;
+
+function modifierEditorBodyHTML(){
+  const d = MODEDIT.draft;
+  return `
+    <div class="field-row">
+      <div class="field" style="flex:2;"><label class="field-label">Name</label><input type="text" value="${esc(d.name)}" oninput="modDraftSet('name',this.value)"></div>
+      <div class="field"><label class="field-label">Icon / Emoji</label><input type="text" value="${esc(d.icon)}" placeholder="e.g. ☠" oninput="modDraftSet('icon',this.value)"></div>
+      <div class="field"><label class="field-label">Category</label><input type="text" value="${esc(d.category)}" placeholder="e.g. Undead" oninput="modDraftSet('category',this.value)"></div>
+    </div>
+    <div class="field"><label class="field-label">Description</label><textarea oninput="modDraftSet('description',this.value)">${esc(d.description)}</textarea></div>
+    <div class="field"><label class="field-label">Tags</label>${modChipsHTML('tags', d.tags)}</div>
+    <div class="field-row">
+      <div class="field"><label class="field-label">Minimum Level (optional)</label><input type="number" value="${d.levelMin??''}" oninput="modDraftSetNum('levelMin',this.value)"></div>
+      <div class="field"><label class="field-label">Maximum Level (optional)</label><input type="number" value="${d.levelMax??''}" oninput="modDraftSetNum('levelMax',this.value)"></div>
+      <div class="field"><label class="field-label">Stacking</label>
+        <select onchange="modDraftSet('stacking',this.value)">
+          <option value="unique" ${d.stacking==='unique'?'selected':''}>Only one copy per creature (default)</option>
+          <option value="stack" ${d.stacking==='stack'?'selected':''}>Allow multiple copies on the same creature</option>
+        </select>
+      </div>
+      <div class="field"><label class="field-label">Enabled</label><label class="checkbox-row"><input type="checkbox" ${d.enabled!==false?'checked':''} onchange="modDraftSet('enabled',this.checked)"> Available to apply</label></div>
+    </div>
+    <div class="hr"></div>
+    <div class="section-title">Effects</div>
+    <p class="hint mb10">Add one row per change this modifier makes. Each effect is additive on top of the creature's existing stats unless it says otherwise (damage formulas can also replace or multiply).</p>
+    <div id="effects-list">${effectsListHTML(d)}</div>
+    <div class="field-row mt10">
+      <select id="new-effect-kind" style="flex:2;">
+        ${Object.entries(groupBy(EFFECT_KINDS,'group')).map(([g,items])=>`<optgroup label="${esc(g)}">${items.map(e=>`<option value="${e.kind}">${esc(e.label)}</option>`).join('')}</optgroup>`).join('')}
+      </select>
+      <button class="btn btn-sm btn-gold" onclick="addEffectFromPicker()">+ Add Effect</button>
+    </div>
+    <div class="hr"></div>
+    <div class="section-title">Preview</div>
+    ${modifierPreviewHTML(d)}
+  `;
+}
+function groupBy(arr, key){ const o={}; arr.forEach(x=>{ (o[x[key]]=o[x[key]]||[]).push(x); }); return o; }
+function addEffectFromPicker(){
+  const sel = document.getElementById('new-effect-kind');
+  const kind = sel.value;
+  MODEDIT.draft.effects = MODEDIT.draft.effects||[];
+  const eff = blankEffect(kind);
+  MODEDIT.draft.effects.push(eff);
+  MODEDIT.expandedId = eff.id;
+  updateModEditorBody();
+}
+window.addEffectFromPicker = addEffectFromPicker;
+
+function effectsListHTML(d){
+  const effects = d.effects||[];
+  if(!effects.length) return `<p class="faint small">No effects yet — pick a type below and click "+ Add Effect".</p>`;
+  return effects.map((eff,i)=>effectRowHTML(eff,i,effects.length)).join('');
+}
+function effectKindMeta(kind){ return EFFECT_KINDS.find(e=>e.kind===kind) || {label:kind, hint:''}; }
+function effectSummary(eff){
+  const meta = effectKindMeta(eff.kind);
+  try{
+    switch(eff.kind){
+      case 'ability_score': return `${ABIL_LABEL[eff.ability]} score ${describeScaling(eff.scaling)}`;
+      case 'ability_mod': return `${ABIL_LABEL[eff.ability]} modifier ${describeScaling(eff.scaling)}`;
+      case 'stat': return `${(STAT_TARGETS[eff.stat]||{}).label||eff.stat} ${describeScaling(eff.scaling)}`;
+      case 'save': return `${ABIL_LABEL[eff.ability]} save ${describeScaling(eff.scaling)}`;
+      case 'skill': return `${eff.skillName||'(unnamed skill)'} ${describeScaling(eff.scaling)}`;
+      case 'resistance': return `Resist: ${joinList(eff.damageTypes||[])||'(none selected)'}`;
+      case 'immunity': return `Immune: ${joinList(eff.damageTypes||[])||'(none selected)'}`;
+      case 'vulnerability': return `Vulnerable: ${joinList(eff.damageTypes||[])||'(none selected)'}`;
+      case 'condition_immunity': return `Condition immune: ${joinList(eff.conditions||[])||'(none selected)'}`;
+      case 'tempHP': return `Grants temp HP ${describeScaling(eff.scaling)}`;
+      case 'attack_add': return `Adds attack "${eff.name}" (${eff.dice.count}d${eff.dice.sides} ${eff.damageType||''})`;
+      case 'attack_remove': return `Removes attack "${eff.targetName||'(unnamed)'}"`;
+      case 'attack_roll': return `${eff.applyToAll?'All attacks':'"'+(eff.targetName||'')+'"'} attack roll ${describeScaling(eff.scaling)}`;
+      case 'damage': return `${eff.applyToAll?'All attacks':'"'+(eff.targetName||'(unnamed)')+'"'} damage: ${effectDamageModeLabel(eff.mode)}`;
+      case 'trait_add': return `Adds trait "${eff.name}"`;
+      case 'trait_remove': return `Removes trait "${eff.targetName||'(unnamed)'}"`;
+      case 'descriptive': return `${(DESCRIPTIVE_SUBTYPES.find(x=>x.id===eff.subtype)||{}).label||'Descriptive effect'}${eff.name?': '+eff.name:''}`;
+      default: return meta.label;
+    }
+  }catch(e){ return meta.label; }
+}
+function effectDamageModeLabel(mode){
+  return {add_dice:'add dice', replace_dice:'replace formula', multiply_dice:'multiply dice count', flat_bonus:'flat bonus only', multiply_total:'multiply rolled total'}[mode] || mode;
+}
+function effectRowHTML(eff, i, count){
+  const expanded = MODEDIT.expandedId === eff.id;
+  const meta = effectKindMeta(eff.kind);
+  return `
+    <div class="entry-row mb6">
+      <div class="flex-between" style="cursor:pointer;" onclick="toggleEffectExpand('${eff.id}')">
+        <div class="small"><b>${esc(meta.label)}</b><span class="faint"> — ${esc(effectSummary(eff))}</span>${eff.enabled===false?' <span class="faint">(disabled)</span>':''}</div>
+        <span class="chev">${expanded?'▲':'▼'}</span>
+      </div>
+      ${expanded?`
+        <div class="mt6">
+          <p class="hint">${esc(meta.hint)}</p>
+          ${effectFieldsHTML(eff, i)}
+          <div class="btn-row mt10">
+            <label class="checkbox-row"><input type="checkbox" ${eff.enabled!==false?'checked':''} onchange="modDraftSet('effects.${i}.enabled',this.checked);updateModEditorBody();"> Enabled</label>
+            <div class="nav-spacer"></div>
+            <button class="btn btn-xs" ${i===0?'disabled':''} onclick="moveEffect(${i},-1)">&uarr; Up</button>
+            <button class="btn btn-xs" ${i===count-1?'disabled':''} onclick="moveEffect(${i},1)">&darr; Down</button>
+            <button class="btn btn-xs" onclick="duplicateEffect(${i})">Duplicate</button>
+            <button class="btn btn-xs btn-danger" onclick="modArrRemoveAt('effects',${i});updateModEditorBody();">Delete</button>
+          </div>
+        </div>` : ''}
+    </div>`;
+}
+function toggleEffectExpand(id){ MODEDIT.expandedId = (MODEDIT.expandedId===id) ? null : id; updateModEditorBody(); }
+window.toggleEffectExpand = toggleEffectExpand;
+function moveEffect(i, dir){
+  const arr = MODEDIT.draft.effects;
+  const j = i+dir;
+  if(j<0 || j>=arr.length) return;
+  const tmp = arr[i]; arr[i]=arr[j]; arr[j]=tmp;
+  updateModEditorBody();
+}
+window.moveEffect = moveEffect;
+function duplicateEffect(i){
+  const arr = MODEDIT.draft.effects;
+  const copy = deepClone(arr[i]); copy.id = uid('eff');
+  arr.splice(i+1,0,copy);
+  MODEDIT.expandedId = copy.id;
+  updateModEditorBody();
+}
+window.duplicateEffect = duplicateEffect;
+
+function scalingEditorHTML(path, scaling, baseLabel){
+  scaling = scaling || blankScaling(0);
+  return `
+    <div class="field-row">
+      <div class="field"><label class="field-label">Scaling Method</label>
+        <select onchange="modDraftSet('${path}.method',this.value);updateModEditorBody();">
+          ${SCALING_METHODS.map(m=>`<option value="${m.id}" ${scaling.method===m.id?'selected':''}>${esc(m.label)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field"><label class="field-label">${esc(baseLabel||'Base Value')}</label><input type="number" value="${scaling.base??0}" oninput="modDraftSetNum('${path}.base',this.value);updateModPreviewOnly();"></div>
+      ${scaling.method!=='flat' && scaling.method!=='custom' ? `<div class="field"><label class="field-label">Per Level/Point</label><input type="number" value="${scaling.perLevel??0}" oninput="modDraftSetNum('${path}.perLevel',this.value);updateModPreviewOnly();"></div>` : ''}
+    </div>
+    ${scaling.method==='custom' ? `<div class="field"><label class="field-label">Custom Formula</label>
+        <input type="text" value="${esc(scaling.formula||'')}" placeholder="e.g. base + level*2" oninput="modDraftSet('${path}.formula',this.value);updateModPreviewOnly();">
+        <p class="hint">Allowed: numbers, + - * / ( ), and the variables <code>level</code>, <code>prof</code>, <code>hitdice</code>, <code>base</code>, <code>perlevel</code>. No other code can run here.</p>
+      </div>` : ''}
+    <p class="small faint">At level 1: ${fmtMod(safeScalingPreview(scaling,1))} &nbsp;·&nbsp; At level 5: ${fmtMod(safeScalingPreview(scaling,5))}</p>
+  `;
+}
+function safeScalingPreview(scaling, level){
+  try{ return evalScaling(scaling, {level, prof: 2+Math.floor((level-1)/4), hitDice: level}); }
+  catch(e){ return 0; }
+}
+function updateModPreviewOnly(){
+  const el = document.getElementById('mod-preview-host');
+  if(el) el.innerHTML = modifierPreviewHTML(MODEDIT.draft);
+}
+window.updateModPreviewOnly = updateModPreviewOnly;
+
+function effectFieldsHTML(eff, i){
+  const p = 'effects.'+i;
+  switch(eff.kind){
+    case 'ability_score': case 'ability_mod':
+      return `
+        <div class="field"><label class="field-label">Ability</label>
+          <select onchange="modDraftSet('${p}.ability',this.value);updateModEditorBody();">${ABILS.map(a=>`<option value="${a}" ${eff.ability===a?'selected':''}>${ABIL_LABEL[a]}</option>`).join('')}</select>
+        </div>
+        ${scalingEditorHTML(p+'.scaling', eff.scaling, eff.kind==='ability_score'?'Base Score Change':'Base Modifier Change')}`;
+    case 'stat':
+      return `
+        <div class="field"><label class="field-label">Stat</label>
+          <select onchange="modDraftSet('${p}.stat',this.value);updateModEditorBody();">${Object.entries(STAT_TARGETS).map(([k,t])=>`<option value="${k}" ${eff.stat===k?'selected':''}>${esc(t.label)}</option>`).join('')}</select>
+        </div>
+        ${scalingEditorHTML(p+'.scaling', eff.scaling)}`;
+    case 'save':
+      return `
+        <div class="field"><label class="field-label">Ability Save</label>
+          <select onchange="modDraftSet('${p}.ability',this.value);updateModEditorBody();">${ABILS.map(a=>`<option value="${a}" ${eff.ability===a?'selected':''}>${ABIL_LABEL[a]}</option>`).join('')}</select>
+        </div>
+        ${scalingEditorHTML(p+'.scaling', eff.scaling)}`;
+    case 'skill':
+      return `
+        <div class="field"><label class="field-label">Skill Name</label>
+          <input type="text" list="skill-list-dl" value="${esc(eff.skillName||'')}" placeholder="e.g. perception" oninput="modDraftSet('${p}.skillName',this.value)">
+          <datalist id="skill-list-dl">${SKILLS.map(s=>`<option value="${s[0]}">`).join('')}</datalist>
+        </div>
+        ${scalingEditorHTML(p+'.scaling', eff.scaling)}`;
+    case 'resistance': case 'immunity': case 'vulnerability':
+      return `<div class="field"><label class="field-label">Damage Types</label>${damageTypeCheckboxes(p+'.damageTypes', eff.damageTypes)}</div>`;
+    case 'condition_immunity':
+      return `<div class="field"><label class="field-label">Conditions</label>${conditionCheckboxes(p+'.conditions', eff.conditions)}</div>`;
+    case 'tempHP':
+      return scalingEditorHTML(p+'.scaling', eff.scaling, 'Base Temp HP');
+    case 'attack_add':
+      return `
+        <div class="field-row">
+          <div class="field" style="flex:2;"><label class="field-label">Attack Name</label><input type="text" value="${esc(eff.name)}" oninput="modDraftSet('${p}.name',this.value)"></div>
+          <div class="field"><label class="field-label">List</label>
+            <select onchange="modDraftSet('${p}.targetList',this.value)">
+              <option value="actions" ${eff.targetList==='actions'?'selected':''}>Actions</option>
+              <option value="bonusActions" ${eff.targetList==='bonusActions'?'selected':''}>Bonus Actions</option>
+              <option value="reactions" ${eff.targetList==='reactions'?'selected':''}>Reactions</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label class="field-label">Range</label><input type="text" value="${esc(eff.range||'')}" oninput="modDraftSet('${p}.range',this.value)"></div>
+          <div class="field"><label class="field-label">Reach</label><input type="text" value="${esc(eff.reach||'')}" oninput="modDraftSet('${p}.reach',this.value)"></div>
+          <div class="field"><label class="field-label">Damage Type</label>
+            <select onchange="modDraftSet('${p}.damageType',this.value)"><option value="">(none)</option>${DAMAGE_TYPES.map(t=>`<option value="${t}" ${eff.damageType===t?'selected':''}>${t}</option>`).join('')}</select>
+          </div>
+        </div>
+        <div class="section-title">Attack Bonus</div>
+        ${scalingEditorHTML(p+'.attackBonusScaling', eff.attackBonusScaling, 'Base Attack Bonus')}
+        <div class="section-title">Damage Dice (die size fixed, count scales)</div>
+        <div class="field-row">
+          <div class="field"><label class="field-label">Base Dice Count</label><input type="number" min="0" value="${eff.dice.count}" oninput="modDraftSetNum('${p}.dice.count',this.value)"></div>
+          <div class="field"><label class="field-label">Die Size</label>
+            <select onchange="modDraftSetNum('${p}.dice.sides',this.value)">${[4,6,8,10,12,20].map(s=>`<option value="${s}" ${eff.dice.sides===s?'selected':''}>d${s}</option>`).join('')}</select>
+          </div>
+        </div>
+        ${scalingEditorHTML(p+'.diceCountScaling', eff.diceCountScaling, 'Extra Dice Count (added to base)')}
+        <div class="section-title">Flat Damage Bonus</div>
+        ${scalingEditorHTML(p+'.flatScaling', eff.flatScaling, 'Base Flat Bonus')}`;
+    case 'attack_remove':
+      return `
+        <div class="field-row">
+          <div class="field"><label class="field-label">List</label>
+            <select onchange="modDraftSet('${p}.targetList',this.value)">
+              <option value="actions" ${eff.targetList==='actions'?'selected':''}>Actions</option>
+              <option value="bonusActions" ${eff.targetList==='bonusActions'?'selected':''}>Bonus Actions</option>
+              <option value="reactions" ${eff.targetList==='reactions'?'selected':''}>Reactions</option>
+            </select>
+          </div>
+          <div class="field" style="flex:2;"><label class="field-label">Attack Name (exact)</label><input type="text" value="${esc(eff.targetName||'')}" oninput="modDraftSet('${p}.targetName',this.value)"></div>
+        </div>`;
+    case 'attack_roll':
+      return `
+        <div class="field"><label class="field-label checkbox-row"><input type="checkbox" ${eff.applyToAll?'checked':''} onchange="modDraftSet('${p}.applyToAll',this.checked);updateModEditorBody();"> Apply to every attack</label></div>
+        ${!eff.applyToAll?`<div class="field-row">
+          <div class="field"><label class="field-label">List</label>
+            <select onchange="modDraftSet('${p}.targetList',this.value)">
+              <option value="actions" ${eff.targetList==='actions'?'selected':''}>Actions</option>
+              <option value="bonusActions" ${eff.targetList==='bonusActions'?'selected':''}>Bonus Actions</option>
+              <option value="reactions" ${eff.targetList==='reactions'?'selected':''}>Reactions</option>
+            </select>
+          </div>
+          <div class="field" style="flex:2;"><label class="field-label">Attack Name (exact)</label><input type="text" value="${esc(eff.targetName||'')}" oninput="modDraftSet('${p}.targetName',this.value)"></div>
+        </div>`:''}
+        ${scalingEditorHTML(p+'.scaling', eff.scaling, 'Base Attack Roll Bonus')}`;
+    case 'damage':
+      return `
+        <div class="field"><label class="field-label checkbox-row"><input type="checkbox" ${eff.applyToAll?'checked':''} onchange="modDraftSet('${p}.applyToAll',this.checked);updateModEditorBody();"> Apply to every attack</label></div>
+        ${!eff.applyToAll?`<div class="field-row">
+          <div class="field"><label class="field-label">List</label>
+            <select onchange="modDraftSet('${p}.targetList',this.value)">
+              <option value="actions" ${eff.targetList==='actions'?'selected':''}>Actions</option>
+              <option value="bonusActions" ${eff.targetList==='bonusActions'?'selected':''}>Bonus Actions</option>
+              <option value="reactions" ${eff.targetList==='reactions'?'selected':''}>Reactions</option>
+            </select>
+          </div>
+          <div class="field" style="flex:2;"><label class="field-label">Attack Name (exact)</label><input type="text" value="${esc(eff.targetName||'')}" oninput="modDraftSet('${p}.targetName',this.value)"></div>
+        </div>`:''}
+        <div class="field"><label class="field-label">How should this change the damage? (be explicit — these are NOT interchangeable)</label>
+          <select onchange="modDraftSet('${p}.mode',this.value);updateModEditorBody();">
+            <option value="add_dice" ${eff.mode==='add_dice'?'selected':''}>Add extra dice on top of the existing formula</option>
+            <option value="replace_dice" ${eff.mode==='replace_dice'?'selected':''}>Replace the whole damage formula</option>
+            <option value="multiply_dice" ${eff.mode==='multiply_dice'?'selected':''}>Multiply the number of existing dice</option>
+            <option value="flat_bonus" ${eff.mode==='flat_bonus'?'selected':''}>Flat bonus only (dice unchanged)</option>
+            <option value="multiply_total" ${eff.mode==='multiply_total'?'selected':''}>Multiply the ROLLED total (applied when you click Roll Damage, not shown in the stat block)</option>
+          </select>
+        </div>
+        ${eff.mode==='add_dice'||eff.mode==='replace_dice'?`
+          <div class="field-row">
+            <div class="field"><label class="field-label">Base Dice Count</label><input type="number" min="0" value="${eff.dice.count}" oninput="modDraftSetNum('${p}.dice.count',this.value)"></div>
+            <div class="field"><label class="field-label">Die Size</label>
+              <select onchange="modDraftSetNum('${p}.dice.sides',this.value)">${[4,6,8,10,12,20].map(s=>`<option value="${s}" ${eff.dice.sides===s?'selected':''}>d${s}</option>`).join('')}</select>
+            </div>
+          </div>
+          ${scalingEditorHTML(p+'.diceCountScaling', eff.diceCountScaling, 'Extra Dice Count (added to base, per level)')}`:''}
+        ${eff.mode==='multiply_dice'||eff.mode==='multiply_total'?`
+          <div class="field"><label class="field-label">Multiply By</label><input type="number" step="0.5" min="0" value="${eff.multiplyBy}" oninput="modDraftSetNum('${p}.multiplyBy',this.value)"></div>`:''}
+        ${eff.mode!=='multiply_total'?`<div class="section-title">Flat Damage Bonus</div>${scalingEditorHTML(p+'.flatScaling', eff.flatScaling, 'Base Flat Bonus')}`:''}
+        <div class="field"><label class="field-label">Change Damage Type To (optional)</label>
+          <select onchange="modDraftSet('${p}.damageType',this.value)"><option value="">(leave as-is)</option>${DAMAGE_TYPES.map(t=>`<option value="${t}" ${eff.damageType===t?'selected':''}>${t}</option>`).join('')}</select>
+        </div>`;
+    case 'trait_add':
+      return `
+        <div class="field"><label class="field-label">Trait Name</label><input type="text" value="${esc(eff.name)}" oninput="modDraftSet('${p}.name',this.value)"></div>
+        <div class="field"><label class="field-label">Description</label><textarea oninput="modDraftSet('${p}.description',this.value)">${esc(eff.description||'')}</textarea></div>`;
+    case 'trait_remove':
+      return `<div class="field"><label class="field-label">Trait Name (exact)</label><input type="text" value="${esc(eff.targetName||'')}" oninput="modDraftSet('${p}.targetName',this.value)"></div>`;
+    case 'descriptive':
+      return `
+        <div class="field"><label class="field-label">Type</label>
+          <select onchange="modDraftSet('${p}.subtype',this.value)">${DESCRIPTIVE_SUBTYPES.map(s=>`<option value="${s.id}" ${eff.subtype===s.id?'selected':''}>${esc(s.label)}</option>`).join('')}</select>
+        </div>
+        <div class="field"><label class="field-label">Short Name (optional — defaults to the type above)</label><input type="text" value="${esc(eff.name||'')}" oninput="modDraftSet('${p}.name',this.value)"></div>
+        <div class="field"><label class="field-label">Description</label><textarea placeholder="Explain exactly what this does at the table — Warden will add this as a trait note but won't simulate it automatically." oninput="modDraftSet('${p}.description',this.value)">${esc(eff.description||'')}</textarea></div>`;
+    default: return '';
+  }
+}
+function damageTypeCheckboxes(path, selected){
+  selected = selected||[];
+  return `<div class="flex-wrap gap6">${DAMAGE_TYPES.map(t=>`
+    <label class="checkbox-row"><input type="checkbox" ${selected.indexOf(t)>=0?'checked':''}
+      onchange="modToggleListItem('${path}','${t}',this.checked)"> ${t}</label>`).join('')}</div>`;
+}
+function conditionCheckboxes(path, selected){
+  selected = selected||[];
+  return `<div class="flex-wrap gap6">${CONDITIONS.map(c=>`
+    <label class="checkbox-row"><input type="checkbox" ${selected.indexOf(c)>=0?'checked':''}
+      onchange="modToggleListItem('${path}','${c}',this.checked)"> ${c}</label>`).join('')}</div>`;
+}
+function modToggleListItem(path, value, checked){
+  const arr = getPathSafe(MODEDIT.draft, path)||[];
+  const idx = arr.indexOf(value);
+  if(checked && idx<0) arr.push(value);
+  if(!checked && idx>=0) arr.splice(idx,1);
+  setPathSafe(MODEDIT.draft, path, arr);
+}
+window.modToggleListItem = modToggleListItem;
+
+/* Live preview inside the modifier editor: run the modifier (and only
+   this modifier) against a sample creature so the author can see what
+   it actually does before saving. Uses a throwaway in-memory modifier
+   entry so this never touches DB.modifiers. */
+UI.modifierPreviewSample = { templateId:null, level:1 };
+function modifierPreviewHTML(d){
+  const pool = activeTemplates();
+  if(!pool.length) return `<p class="faint small">Create a creature in your Library to preview against.</p>`;
+  if(!UI.modifierPreviewSample.templateId) UI.modifierPreviewSample.templateId = pool[0].id;
+  const sample = getTemplate(UI.modifierPreviewSample.templateId) || pool[0];
+  const level = UI.modifierPreviewSample.level;
+  const tempId = 'preview_'+(d.id||'draft');
+  const prevExisting = getModifierAny(tempId);
+  // Temporarily register the in-progress draft under a scratch id so computeModifiedCreature can find it,
+  // then remove it immediately — this never persists and is never saved/synced.
+  const scratch = deepClone(d); scratch.id = tempId; scratch.deletedAt = null; scratch.enabled = true;
+  DB.modifiers.push(scratch);
+  let result;
+  try{ result = computeModifiedCreature(sample, [tempId], level); }
+  finally{ DB.modifiers = DB.modifiers.filter(m=>m.id!==tempId); }
+  return `
+    <div id="mod-preview-host">
+      <div class="field-row">
+        <div class="field"><label class="field-label">Preview against</label>
+          <select onchange="UI.modifierPreviewSample.templateId=this.value;updateModPreviewOnly();">
+            ${pool.map(t=>`<option value="${t.id}" ${t.id===sample.id?'selected':''}>${esc(t.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label class="field-label">At level/scaling value</label><input type="number" min="1" value="${level}" oninput="UI.modifierPreviewSample.level=Number(this.value)||1;updateModPreviewOnly();"></div>
+      </div>
+      ${breakdownHTML(result.breakdown)}
+      ${result.warnings.length?`<div class="mt10">${result.warnings.map(w=>`<p class="small" style="color:var(--blood-bright)">&#9888; ${esc(w)}</p>`).join('')}</div>`:''}
+    </div>`;
+}
+function breakdownHTML(breakdown){
+  const keys = Object.keys(breakdown||{});
+  if(!keys.length) return `<p class="faint small">No effects produce a calculable change yet.</p>`;
+  return `<div class="grid gap6">${keys.map(k=>{
+    const b = breakdown[k];
+    if(b.textOnly) return `<div class="entry-row"><b class="small">${esc(b.label)}</b><div class="small faint">${b.notes.map(esc).join('<br>')}</div></div>`;
+    return `<div class="entry-row flex-between">
+        <span class="small"><b>${esc(b.label)}</b></span>
+        <span class="small">${fmtMod(b.base)} ${b.adjustments.map(a=>` ${a.value>=0?'+':'−'} ${Math.abs(a.value)} (${esc(a.source)})`).join('')} = <b>${fmtMod(b.final)}</b></span>
+      </div>`;
+  }).join('')}</div>`;
+}
+
+/* ---------------------------------------------------------------
+   27d. APPLY MODIFIERS — pick a creature + modifiers + level, preview
+   the result, then either add it straight to an encounter (temporary)
+   or save it as a reusable Variant in the Creature Library.
+--------------------------------------------------------------- */
+let APPLYMOD = null; // {templateId, selectedIds:[], level, campId, encId, qty}
+function openApplyModifiersModal(templateId, encounterCtx){
+  const tpl = getTemplate(templateId);
+  if(!tpl){ toast('Creature not found.', true); return; }
+  APPLYMOD = { templateId, selectedIds: [], level: 1, campId: encounterCtx&&encounterCtx.campId, encId: encounterCtx&&encounterCtx.encId };
+  pushModal({ key:'apply-modifiers', size:'xl', render: renderApplyModifiersModal });
+}
+window.openApplyModifiersModal = openApplyModifiersModal;
+
+function renderApplyModifiersModal(){
+  const tpl = getTemplate(APPLYMOD.templateId);
+  if(!tpl){ return `<div class="modal-head"><h2>Apply Modifiers</h2><button class="modal-close" onclick="popModal()">&times;</button></div><div class="modal-body"><p>That creature no longer exists.</p></div>`; }
+  const mods = activeModifiers();
+  let result = null, errorMsg = null;
+  try{ result = computeModifiedCreature(tpl, APPLYMOD.selectedIds, APPLYMOD.level); }
+  catch(e){ errorMsg = e.message; }
+  return `
+    <div class="modal-head"><h2>Apply Modifiers — ${esc(tpl.name)}</h2><button class="modal-close" onclick="popModal()">&times;</button></div>
+    <div class="modal-body">
+      <div class="field-row">
+        <div class="field"><label class="field-label">Scaling Level / Value</label>
+          <input type="number" min="1" value="${APPLYMOD.level}" oninput="APPLYMOD.level=Number(this.value)||1;renderModals();">
+          <p class="hint">This is a modifier-scaling value you choose — it is completely separate from this creature's Challenge Rating, which is never changed.</p>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field-label">Modifiers to apply</label>
+        ${mods.length ? `<div class="grid gap6">${mods.map(m=>applyModifierRowHTML(m, tpl)).join('')}</div>`
+          : `<p class="faint small">No modifiers yet — go to the Modifiers page to create one or add the built-in examples.</p>`}
+      </div>
+      <div class="hr"></div>
+      <div class="section-title">Preview</div>
+      ${errorMsg?`<p class="small" style="color:var(--blood-bright)">&#9888; ${esc(errorMsg)}</p>`:breakdownHTML(result.breakdown)}
+      ${result && result.warnings.length?`<div class="mt10">${result.warnings.map(w=>`<p class="small" style="color:var(--blood-bright)">&#9888; ${esc(w)}</p>`).join('')}</div>`:''}
+      ${result ? applyModifiersActionDamageTable(result.creature) : ''}
+    </div>
+    <div class="modal-foot">
+      ${APPLYMOD.campId?`
+        <div class="field" style="margin-right:8px;max-width:90px;"><input type="number" min="1" value="${APPLYMOD.qty||1}" oninput="APPLYMOD.qty=Number(this.value)||1;" title="Quantity to add"></div>
+        <button class="btn btn-gold" onclick="applyModifiersAddToEncounter()">Add to Encounter</button>`:''}
+      <button class="btn btn-primary" onclick="applyModifiersSaveVariant()">Save as Variant…</button>
+      <button class="btn" onclick="popModal()">Close</button>
+    </div>`;
+}
+function applyModifierRowHTML(m, tpl){
+  const checked = APPLYMOD.selectedIds.indexOf(m.id)>=0;
+  const sizeOk = !m.allowedSizes || !m.allowedSizes.length || m.allowedSizes.indexOf(tpl.size)>=0;
+  const typeOk = !m.allowedTypes || !m.allowedTypes.length || m.allowedTypes.map(t=>t.toLowerCase()).indexOf((tpl.type||'').toLowerCase())>=0;
+  const restricted = !sizeOk || !typeOk;
+  return `
+    <label class="entry-row flex-between" style="cursor:pointer;${restricted?'opacity:0.6;':''}">
+      <span class="small"><input type="checkbox" ${checked?'checked':''} onchange="toggleApplyModifier('${m.id}',this.checked)"> <b>${m.icon?esc(m.icon)+' ':''}${esc(m.name)}</b>
+        ${restricted?'<span class="faint"> — may not fit this creature (size/type restriction)</span>':''}
+        ${m.description?`<span class="faint"> — ${esc(m.description.slice(0,80))}</span>`:''}
+      </span>
+    </label>`;
+}
+function toggleApplyModifier(id, checked){
+  const i = APPLYMOD.selectedIds.indexOf(id);
+  if(checked && i<0) APPLYMOD.selectedIds.push(id);
+  if(!checked && i>=0) APPLYMOD.selectedIds.splice(i,1);
+  renderModals();
+}
+window.toggleApplyModifier = toggleApplyModifier;
+function applyModifiersActionDamageTable(creature){
+  const all = [...(creature.actions||[]), ...(creature.bonusActions||[]), ...(creature.reactions||[])];
+  if(!all.length) return '';
+  return `<div class="mt10"><div class="section-title">Attacks</div>
+    ${all.map(a=>`<div class="entry-row small flex-between"><span><b>${esc(a.name)}</b>${a._fromModifier?' <span class="pill">new</span>':''}</span>
+      <span>${a.attackBonus?('Atk '+esc(a.attackBonus)+' · '):''}${esc(a.damageDice||'—')}${a.damageType?' '+esc(a.damageType):''}</span></div>`).join('')}
+  </div>`;
+}
+function applyModifiersAddToEncounter(){
+  const tpl = getTemplate(APPLYMOD.templateId);
+  const enc = getEncounter(APPLYMOD.campId, APPLYMOD.encId);
+  if(!tpl || !enc){ toast('Could not find that creature or encounter.', true); return; }
+  const qty = clamp(APPLYMOD.qty||1, 1, 50);
+  const existingCount = enc.participants.filter(p=>p.templateId===tpl.id).length;
+  for(let i=1;i<=qty;i++){
+    const inst = instanceFromTemplateWithModifiers(tpl, APPLYMOD.selectedIds, APPLYMOD.level, qty===1&&existingCount===0?null:(existingCount+i));
+    enc.participants.push(inst);
+  }
+  touchRecentGlobal(tpl.id);
+  const camp = getCampaign(APPLYMOD.campId);
+  if(camp) touchRecentCampaign(camp, tpl.id);
+  persistEncounter(APPLYMOD.campId, APPLYMOD.encId);
+  toast((qty>1?`Added ${qty}× `:'Added ')+tpl.name+(APPLYMOD.selectedIds.length?' with modifiers':''));
+  APPLYMOD = null;
+  closeAllModals();
+  render();
+}
+window.applyModifiersAddToEncounter = applyModifiersAddToEncounter;
+function applyModifiersSaveVariant(){
+  const tpl = getTemplate(APPLYMOD.templateId);
+  if(!tpl) return;
+  const modNames = APPLYMOD.selectedIds.map(id=>getModifier(id)).filter(Boolean).map(m=>m.name);
+  const defaultName = modNames.length ? `${tpl.name} (${modNames.join(' ')})` : `${tpl.name} (Modified)`;
+  openPromptModal({
+    title:'Save as Creature Variant', label:'Variant name', value: defaultName, submitLabel:'Save Variant',
+    onSubmit:(name)=>{
+      if(!name || !name.trim()){ toast('Give the variant a name.', true); return; }
+      const variant = saveCreatureVariant(tpl, APPLYMOD.selectedIds, APPLYMOD.level, name.trim());
+      toast('Saved "'+variant.name+'" to your Creature Library');
+      APPLYMOD = null;
+      closeAllModals();
+      go('library');
+    }
+  });
+}
+window.applyModifiersSaveVariant = applyModifiersSaveVariant;
+
+/* ---- Variant "recompute from base" (Creature Library) ---- */
+function confirmRecomputeVariant(id){
+  const v = getTemplate(id); if(!v) return;
+  openConfirmModal({
+    title:'Recompute variant from base creature?', danger:true, confirmLabel:'Recompute',
+    body:`This re-runs "${esc(v.name)}"'s saved modifiers against the current version of its base creature. Any manual edits you've made directly to this variant's stats, attacks, or traits since it was created will be OVERWRITTEN. This cannot be undone unless you have a backup export.`,
+    onConfirm:()=>{
+      const res = recomputeVariant(id);
+      if(!res){ toast('Could not recompute — the base creature may have been deleted.', true); return; }
+      toast('Recomputed "'+res.variant.name+'"'+(res.warnings.length?' (see warnings)':''));
+      render();
+    }
+  });
+}
+window.confirmRecomputeVariant = confirmRecomputeVariant;
+
+/* ---------------------------------------------------------------
+   27e. COMBAT PARTICIPANT INTEGRATION — show which modifiers are
+   active on a participant, with toggles, and a breakdown view.
+--------------------------------------------------------------- */
+UI.modifierBreakdownOpen = {}; // participantId -> bool
+function participantModifiersHTML(camp, enc, p){
+  const sm = p.sourceModifiers;
+  const allIds = sm.baselineTemplate ? [] : [];
+  const originalIds = (sm.baselineTemplate && sm.originalModifierIds) || sm.modifierIds;
+  // originalModifierIds (if present) lists every modifier the participant started with, so toggling
+  // one off and back on later doesn't lose it; fall back to the current list for older saves.
+  const chipIds = sm.originalModifierIds || sm.modifierIds;
+  const open = !!UI.modifierBreakdownOpen[p.id];
+  return `
+    <div class="mt6" style="border-top:1px solid var(--border-soft);padding-top:6px;">
+      <div class="flex-between small" style="cursor:pointer;" onclick="toggleParticipantBreakdown('${p.id}')">
+        <span>&#9889; Modifiers (Lvl ${sm.level})</span><span class="chev">${open?'▲':'▼'}</span>
+      </div>
+      <div class="flex-wrap gap6 mt6">
+        ${chipIds.map(id=>{
+          const m = getModifierAny(id);
+          const active = sm.modifierIds.indexOf(id)>=0;
+          return `<label class="pill ${active?'pill-gold':''}" style="cursor:pointer;">
+            <input type="checkbox" style="margin-right:4px;" ${active?'checked':''} onchange="toggleParticipantModifier('${camp.id}','${enc.id}','${p.id}','${id}',this.checked)">
+            ${m?esc(m.name):'(deleted modifier)'}</label>`;
+        }).join('')}
+      </div>
+      ${open?breakdownHTML(p.modifierBreakdown):''}
+      ${open && p.modifierWarnings && p.modifierWarnings.length?p.modifierWarnings.map(w=>`<p class="small" style="color:var(--blood-bright)">&#9888; ${esc(w)}</p>`).join(''):''}
+    </div>`;
+}
+function toggleParticipantBreakdown(id){ UI.modifierBreakdownOpen[id] = !UI.modifierBreakdownOpen[id]; render(); }
+window.toggleParticipantBreakdown = toggleParticipantBreakdown;
+function toggleParticipantModifier(campId, encId, partId, modId, checked){
+  const p = findParticipant(campId, encId, partId);
+  if(!p || !p.sourceModifiers) return;
+  if(!p.sourceModifiers.originalModifierIds) p.sourceModifiers.originalModifierIds = p.sourceModifiers.modifierIds.slice();
+  let ids = p.sourceModifiers.modifierIds.slice();
+  if(checked && ids.indexOf(modId)<0) ids.push(modId);
+  if(!checked) ids = ids.filter(x=>x!==modId);
+  const res = recomputeParticipantModifiers(p, ids);
+  stampSync(p);
+  persistEncounter(campId, encId);
+  if(res) toast(`Modifiers updated${res.hpDelta?` (HP ${res.hpDelta>=0?'+':''}${res.hpDelta})`:''}`);
+  render();
+}
+window.toggleParticipantModifier = toggleParticipantModifier;
 
 </script>
 
